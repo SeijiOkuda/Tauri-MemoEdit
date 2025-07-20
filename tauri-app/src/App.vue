@@ -28,6 +28,8 @@ const text = ref("");
   justify-content: center;
   margin: 0;
   padding: 0;
+  border-radius: 0;
+  overflow-y: scroll;
 }
 
 .cool-textarea {
