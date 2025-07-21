@@ -36,6 +36,11 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 </script>
 
 <template>
+  <nav class="menu-bar">
+    <div class="menu-item" @click="onFileClick">ファイル(F)</div>
+    <div class="menu-item" @click="onEditClick">編集(E)</div>
+    <div class="menu-item" @click="onHelpClick">ヘルプ(H)</div>
+  </nav>
   <main class="fullscreen-container">
     <textarea
       v-model="text"
@@ -51,7 +56,7 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
 .fullscreen-container {
   width: 100vw;
-  height: 100vh;
+  height: calc(100vh - 20px); /* Adjust for menu bar height */
   overflow: hidden;
   background: linear-gradient(135deg, #18181a 0%, #23232b 100%);
   display: flex;
@@ -76,6 +81,26 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
   resize: none;
   outline: none;
   border-radius: 0;
+}
+
+.menu-bar {
+  display: flex;
+  flex-direction: row;
+  width: 100vw;
+  height: 20px;
+  background-color: #505050;
+  padding: 0;
+  margin: 0;
+  gap: 5px;
+}
+
+.menu-item {
+  color: #f6f6f6;
+  user-select: none;
+  text-align: center;
+  font-size: small;
+  width: 70px;
+  margin: 0 0 0 5px;
 }
 
 ::-webkit-scrollbar {
