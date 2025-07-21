@@ -1,4 +1,10 @@
 {
+  "plugins": {
+      "fs": {
+        "requireLiteralLeadingDot": false
+      },
+      "dialog": null
+  },
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "tauri-app",
   "version": "0.1.0",

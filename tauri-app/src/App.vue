@@ -1,7 +1,38 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 const text = ref("");
+
+async function saveFile() {
+  const path = await save({
+    filters: [{ name: 'Text Files', extensions: ['txt'] }],
+    defaultPath: 'memo.txt',
+  });
+  
+  if (path) {
+    try {
+      await writeTextFile(path, text.value);
+      console.log("✅ ファイル保存成功:", path);
+    } catch (err) {
+      console.error("❌ ファイル保存失敗:", err);
+    }
+  } else {
+    console.log("❌ 保存キャンセル");
+  }
+}
+
+function handleKeyDown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    saveFile();
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', handleKeyDown));
+onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
+
 </script>
 
 <template>
