@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { exit } from '@tauri-apps/plugin-process';
 
 const text = ref("");
 const isMenuFile = ref<boolean>(false);
@@ -56,6 +57,13 @@ async function openFile() {
   }
 }
 
+async function exitApp() {
+  await exit()
+  .catch(err => {
+    console.error("❌ アプリ終了失敗:", err);
+  });
+}
+
 onMounted(() => window.addEventListener('keydown', handleKeyDown));
 onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
@@ -69,7 +77,7 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
         <div class="dropdown-item">新しいファイル</div>
         <div class="dropdown-item" @click="openFile">開く</div>
         <div class="dropdown-item" @click="saveFile">保存</div>
-        <div class="dropdown-item">終了</div>
+        <div class="dropdown-item" @click="exitApp">終了</div>
       </div>
     </div>
     <div class="menu-item" @click="onEditClick">編集(E)</div>

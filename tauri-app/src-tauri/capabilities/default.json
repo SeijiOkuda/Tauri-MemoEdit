@@ -19,7 +19,11 @@
     "fs:read-dirs",
     {
       "identifier": "fs:scope",
-      "allow": ["**/*"]
-    }
+      "allow": [
+        "**/*"
+      ]
+    },
+    "process:default",
+    "process:default"
   ]
 }
