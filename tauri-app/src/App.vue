@@ -1,20 +1,24 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 
 const text = ref("");
+const isMenuFile = ref<boolean>(false);
+const path = ref<string | null>(null);
 
 async function saveFile() {
-  const path = await save({
-    filters: [{ name: 'Text Files', extensions: ['txt'] }],
-    defaultPath: 'memo.txt',
-  });
+  if (!path.value) {
+    path.value = await save({
+      filters: [{ name: 'Text Files', extensions: ['txt'] }],
+      defaultPath: 'memo.txt',
+    });
+  }
   
-  if (path) {
+  if (path.value) {
     try {
-      await writeTextFile(path, text.value);
-      console.log("✅ ファイル保存成功:", path);
+      await writeTextFile(path.value, text.value);
+      console.log("✅ ファイル保存成功:", path.value);
     } catch (err) {
       console.error("❌ ファイル保存失敗:", err);
     }
@@ -30,6 +34,28 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 }
 
+function onFileClick() {
+  isMenuFile.value = !isMenuFile.value;
+}
+
+async function openFile() {
+  path.value = await open({
+    filters: [{ name: 'Text Files', extensions: ['txt'] }],
+  });
+
+  if (path.value) {
+    try {
+      const fileContent = await readTextFile(path.value);
+      text.value = fileContent;
+      console.log("✅ ファイル読み込み成功:", path.value);
+    } catch (err) {
+      console.error("❌ ファイル読み込み失敗:", err);
+    }
+  } else {
+    console.log("❌ 開くキャンセル");
+  }
+}
+
 onMounted(() => window.addEventListener('keydown', handleKeyDown));
 onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
@@ -37,7 +63,15 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
 <template>
   <nav class="menu-bar">
-    <div class="menu-item" @click="onFileClick">ファイル(F)</div>
+    <div class="menu-item" @click="onFileClick">
+      ファイル(F)
+      <div v-if="isMenuFile" class="dropdown">
+        <div class="dropdown-item">新しいファイル</div>
+        <div class="dropdown-item" @click="openFile">開く</div>
+        <div class="dropdown-item" @click="saveFile">保存</div>
+        <div class="dropdown-item">終了</div>
+      </div>
+    </div>
     <div class="menu-item" @click="onEditClick">編集(E)</div>
     <div class="menu-item" @click="onHelpClick">ヘルプ(H)</div>
   </nav>
@@ -101,6 +135,28 @@ onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
   font-size: small;
   width: 70px;
   margin: 0 0 0 5px;
+}
+
+.dropdown {
+  position: absolute;
+  top: 30px;
+  left: 0;
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  display: inline-block;
+  z-index: 100;
+}
+
+.dropdown-item {
+  padding: 5px 12px;
+  color: #ccc;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.dropdown-item:hover {
+  background-color: #555;
+  color: #ffffff;
 }
 
 ::-webkit-scrollbar {
