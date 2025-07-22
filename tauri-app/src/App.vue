@@ -64,6 +64,14 @@ async function exitApp() {
   });
 }
 
+function onEditClick() {
+  console.log("編集メニューがクリックされました");
+}
+
+function onHelpClick() {
+  console.log("ヘルプメニューがクリックされました");
+}
+
 onMounted(() => window.addEventListener('keydown', handleKeyDown));
 onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
