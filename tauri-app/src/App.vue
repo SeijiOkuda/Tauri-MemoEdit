@@ -2,11 +2,35 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
+import { invoke } from "@tauri-apps/api/core";
 
 const text = ref("");
 const isMenuFile = ref<boolean>(false);
 const path = ref<string | null>(null);
+
+onMounted(async () => {
+  await listen('open-file', async (event: { payload: string }) => {
+    console.log("📂 外部起動ファイルイベント受信:", event.payload);
+    const filePath = event.payload;
+    path.value = filePath;
+
+    try {
+      const fileContent = await readTextFile(filePath);
+      text.value = fileContent;
+      console.log("📂 外部起動ファイル読み込み成功:", filePath);
+    } catch (err) {
+      console.error("❌ 外部ファイル読み込み失敗:", err);
+    }
+  });
+
+  window.addEventListener("keydown", handleKeyDown);
+
+  invoke("frontend_ready"); 
+});
+
+onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
 async function saveFile() {
   if (!path.value) {
@@ -71,9 +95,6 @@ function onEditClick() {
 function onHelpClick() {
   console.log("ヘルプメニューがクリックされました");
 }
-
-onMounted(() => window.addEventListener('keydown', handleKeyDown));
-onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
 
 </script>
 
