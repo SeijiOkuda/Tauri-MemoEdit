@@ -21,6 +21,7 @@ onMounted(async () => {
     try {
       const fileContent = await readTextFile(filePath);
       text.value = fileContent;
+      textSaved.value = fileContent;
       console.log("📂 外部起動ファイル読み込み成功:", filePath);
     } catch (err) {
       console.error("❌ 外部ファイル読み込み失敗:", err);
@@ -90,6 +91,7 @@ async function openFile() {
     try {
       const fileContent = await readTextFile(path.value);
       text.value = fileContent;
+      textSaved.value = fileContent;
       console.log("✅ ファイル読み込み成功:", path.value);
     } catch (err) {
       console.error("❌ ファイル読み込み失敗:", err);
