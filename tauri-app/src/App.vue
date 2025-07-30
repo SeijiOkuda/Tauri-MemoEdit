@@ -27,6 +27,11 @@ onMounted(async () => {
     }
   });
 
+  await listen("app-close-requested", async () => {
+    console.log("❌ アプリ閉じるリクエストを受信");
+    exitApp();
+  });
+
   window.addEventListener("keydown", handleKeyDown);
   window.addEventListener("click", handleClickOutside);
 

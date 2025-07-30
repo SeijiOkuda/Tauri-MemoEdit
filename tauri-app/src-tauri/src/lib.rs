@@ -5,7 +5,7 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-use tauri::{Manager, Emitter};
+use tauri::{Manager, WindowEvent, Window, Emitter};
 
 #[tauri::command]
 async fn frontend_ready(app: tauri::AppHandle) {
@@ -27,6 +27,12 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window: &Window, event: &WindowEvent| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close(); // 自動で閉じるのをキャンセル
+                let _ = window.emit("app-close-requested", ());
+            }
+        })
         .invoke_handler(tauri::generate_handler![greet, frontend_ready])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
