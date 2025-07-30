@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 const text = ref("");
 const isMenuFile = ref<boolean>(false);
 const path = ref<string | null>(null);
+const menuRef = ref<HTMLElement | null>(null);
 
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
@@ -26,11 +27,21 @@ onMounted(async () => {
   });
 
   window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("click", handleClickOutside);
 
   invoke("frontend_ready"); 
 });
 
-onUnmounted(() => window.removeEventListener('keydown', handleKeyDown));
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeyDown);
+  window.removeEventListener('click', handleClickOutside);
+});
+
+function handleClickOutside(e: MouseEvent) {
+  if (menuRef.value && !menuRef.value.contains(e.target as Node)) {
+    isMenuFile.value = false;
+  }
+}
 
 async function saveFile() {
   if (!path.value) {
@@ -100,7 +111,7 @@ function onHelpClick() {
 
 <template>
   <nav class="menu-bar">
-    <div class="menu-item" @click="onFileClick">
+    <div class="menu-item" @click="onFileClick" ref="menuRef">
       ファイル(F)
       <div v-if="isMenuFile" class="dropdown">
         <div class="dropdown-item">新しいファイル</div>
