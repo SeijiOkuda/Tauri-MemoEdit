@@ -177,13 +177,15 @@ const insertTab = (e: KeyboardEvent) => {
       autofocus
     ></textarea>
   </main>
+  <nav class="footer">
+  </nav>
 </template>
 
 <style scoped>
 
 .fullscreen-container {
   width: 100vw;
-  height: calc(100vh - 20px); /* Adjust for menu bar height */
+  height: calc(100vh - 40px); /* Adjust for menu bar height and footer height */
   overflow: hidden;
   background: linear-gradient(135deg, #18181a 0%, #23232b 100%);
   display: flex;
@@ -259,6 +261,17 @@ const insertTab = (e: KeyboardEvent) => {
 ::-webkit-scrollbar-thumb {
   background: #33334a;
   border-radius: 4px;
+}
+
+.footer {
+  display: flex;
+  flex-direction: row;
+  width: 100vw;
+  height: 20px;
+  background-color: #505050;
+  padding: 0;
+  margin: 0;
+  gap: 5px;
 }
 
 </style>
