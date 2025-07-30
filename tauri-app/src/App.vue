@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 
 const text = ref("");
+const textSaved = ref("");
 const isMenuFile = ref<boolean>(false);
 const path = ref<string | null>(null);
 const menuRef = ref<HTMLElement | null>(null);
@@ -54,6 +55,7 @@ async function saveFile() {
   if (path.value) {
     try {
       await writeTextFile(path.value, text.value);
+      textSaved.value = text.value;
       console.log("✅ ファイル保存成功:", path.value);
     } catch (err) {
       console.error("❌ ファイル保存失敗:", err);
@@ -93,10 +95,25 @@ async function openFile() {
 }
 
 async function exitApp() {
+  const okToExit = await confirmExitIfUnsaved();
+  if (!okToExit) return;
+
   await exit()
   .catch(err => {
     console.error("❌ アプリ終了失敗:", err);
   });
+}
+
+async function confirmExitIfUnsaved(): Promise<boolean> {
+  if (text.value !== textSaved.value) {
+    return await ask("変更が保存されていません。終了しますか？", {
+      title: "確認",
+      kind: 'warning',
+      okLabel: "はい",
+      cancelLabel: "いいえ"
+    });
+  }
+  return true;
 }
 
 function onEditClick() {
