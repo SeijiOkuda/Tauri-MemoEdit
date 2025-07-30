@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, nextTick } from "vue";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { listen } from '@tauri-apps/api/event';
@@ -11,6 +11,7 @@ const textSaved = ref("");
 const isMenuFile = ref<boolean>(false);
 const path = ref<string | null>(null);
 const menuRef = ref<HTMLElement | null>(null);
+const textarea = ref<HTMLTextAreaElement | null>(null);
 
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
@@ -131,6 +132,24 @@ function onHelpClick() {
   console.log("ヘルプメニューがクリックされました");
 }
 
+const insertTab = (e: KeyboardEvent) => {
+  if (textarea.value) {
+    const start = textarea.value.selectionStart;
+    const end = textarea.value.selectionEnd;
+    const value = textarea.value.value;
+
+    text.value = value.substring(0, start) + "\t" + value.substring(end);
+
+    nextTick(() => {
+      if (textarea.value) {
+        textarea.value.selectionStart = textarea.value.selectionEnd = start + 1;
+      }
+    });
+
+    e.preventDefault();
+  }
+};
+
 </script>
 
 <template>
@@ -149,9 +168,11 @@ function onHelpClick() {
   </nav>
   <main class="fullscreen-container">
     <textarea
+      ref="textarea"
       v-model="text"
       class="cool-textarea"
       placeholder="ここにメモを入力..."
+      @keydown.tab.prevent="insertTab"
       spellcheck="false"
       autofocus
     ></textarea>
