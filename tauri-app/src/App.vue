@@ -10,6 +10,8 @@ const text = ref("");
 const textSaved = ref("");
 const isMenuFile = ref<boolean>(false);
 const path = ref<string | null>(null);
+const charCode = ref<string | null>("UTF-8");
+
 const menuRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 
@@ -19,13 +21,10 @@ onMounted(async () => {
     const filePath = event.payload;
     path.value = filePath;
 
-    try {
-      const fileContent = await readTextFile(filePath);
-      text.value = fileContent;
-      textSaved.value = fileContent;
-      console.log("📂 外部起動ファイル読み込み成功:", filePath);
-    } catch (err) {
-      console.error("❌ 外部ファイル読み込み失敗:", err);
+    if (path.value) {
+      await openFile(path.value);
+    } else {
+      console.log("❌ ファイル選択キャンセル");
     }
   });
 
@@ -83,22 +82,25 @@ function onFileClick() {
   isMenuFile.value = !isMenuFile.value;
 }
 
-async function openFile() {
+async function openFileDialog() {
   path.value = await open({
     filters: [{ name: 'Text Files', extensions: ['txt'] }],
   });
-
   if (path.value) {
-    try {
-      const fileContent = await readTextFile(path.value);
-      text.value = fileContent;
-      textSaved.value = fileContent;
-      console.log("✅ ファイル読み込み成功:", path.value);
-    } catch (err) {
-      console.error("❌ ファイル読み込み失敗:", err);
-    }
+    await openFile(path.value);
   } else {
-    console.log("❌ 開くキャンセル");
+    console.log("❌ ファイル選択キャンセル");
+  }
+}
+
+async function openFile(path: string) {
+  try {
+    const fileContent = await readTextFile(path);
+    text.value = fileContent;
+    textSaved.value = fileContent;
+    console.log("✅ ファイル読み込み成功:", path);
+  } catch (err) {
+    console.error("❌ ファイル読み込み失敗:", err);
   }
 }
 
@@ -158,7 +160,7 @@ const insertTab = (e: KeyboardEvent) => {
       ファイル(F)
       <div v-if="isMenuFile" class="dropdown">
         <div class="dropdown-item">新しいファイル</div>
-        <div class="dropdown-item" @click="openFile">開く</div>
+        <div class="dropdown-item" @click="openFileDialog">開く</div>
         <div class="dropdown-item" @click="saveFile">保存</div>
         <div class="dropdown-item" @click="exitApp">終了</div>
       </div>
@@ -178,6 +180,8 @@ const insertTab = (e: KeyboardEvent) => {
     ></textarea>
   </main>
   <nav class="footer">
+    <div class="char-code">{{ charCode }}</div>
+    <div class="path">{{ path }}</div>
   </nav>
 </template>
 
@@ -272,6 +276,33 @@ const insertTab = (e: KeyboardEvent) => {
   padding: 0;
   margin: 0;
   gap: 5px;
+}
+
+.char-code {
+  width: 100px;
+  color: #f6f6f6;
+  user-select: none;
+  text-align: center;
+  font-size: small;
+  padding: 5px 10px;
+  box-sizing: border-box;
+  border-right: 1px solid #ccc;
+  white-space: nowrap;
+  padding: 0;
+  margin: 0;
+}
+
+.path {
+  flex: 1;
+  color: #f6f6f6;
+  user-select: none;
+  font-size: small;
+  padding: 5px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 0 0 10px;
+  margin: 0;
 }
 
 </style>
