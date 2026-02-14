@@ -95,7 +95,7 @@ async function openFileDialog() {
 
 async function openFile(path: string) {
   try {
-    const fileContent = await readTextFile(path);
+    const fileContent = await readTextFile(path, { encoding: "shift_jis" });
     text.value = fileContent;
     textSaved.value = fileContent;
     console.log("✅ ファイル読み込み成功:", path);
