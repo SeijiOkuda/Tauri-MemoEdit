@@ -21,13 +21,6 @@ async fn frontend_ready(app: tauri::AppHandle) {
     }
 }
 
-use std::fs;
-
-fn open_file<E>(path: &str)  -> Result<String, impl Eq> {
-    let content = fs::read_to_string(path)?;
-    Ok::<std::string::String, E>(content)
-}
-
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
@@ -36,11 +29,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window: &Window, event: &WindowEvent| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
+                api.prevent_close(); // 自動で閉じるのをキャンセル
                 let _ = window.emit("app-close-requested", ());
             }
         })
-        .invoke_handler(tauri::generate_handler![greet,frontend_ready,open_file])
+        .invoke_handler(tauri::generate_handler![greet, frontend_ready])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
