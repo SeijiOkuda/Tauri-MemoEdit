@@ -9,10 +9,12 @@ import { invoke } from "@tauri-apps/api/core";
 const text = ref("");
 const textSaved = ref("");
 const isMenuFile = ref<boolean>(false);
+const isMenuEncoding = ref<boolean>(false);
 const path = ref<string | null>(null);
-const charCode = ref<string | null>("UTF-8");
+const charCode = ref<string | null>("utf-8");
 
 const menuRef = ref<HTMLElement | null>(null);
+const menuEncodingRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 
 onMounted(async () => {
@@ -48,6 +50,9 @@ function handleClickOutside(e: MouseEvent) {
   if (menuRef.value && !menuRef.value.contains(e.target as Node)) {
     isMenuFile.value = false;
   }
+  if (menuEncodingRef.value && !menuEncodingRef.value.contains(e.target as Node)) {
+    isMenuEncoding.value = false;
+  }
 }
 
 async function saveFile() {
@@ -82,6 +87,10 @@ function onFileClick() {
   isMenuFile.value = !isMenuFile.value;
 }
 
+function onEncodingClick() {
+  isMenuEncoding.value = !isMenuEncoding.value;
+}
+
 async function openFileDialog() {
   path.value = await open({
     filters: [{ name: 'Text Files', extensions: ['txt'] }],
@@ -95,12 +104,22 @@ async function openFileDialog() {
 
 async function openFile(path: string) {
   try {
-    const fileContent = await readTextFile(path, { encoding: "shift_jis" });
+    const fileContent = await readTextFile(path, { encoding: charCode.value? charCode.value : "utf-8" });
     text.value = fileContent;
     textSaved.value = fileContent;
     console.log("✅ ファイル読み込み成功:", path);
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
+  }
+}
+
+async function reOpenFile(path: string, encoding: string) {
+  try {
+    charCode.value = encoding;
+    await openFile(path);
+    console.log("✅ ファイル再読み込み成功:", path, "エンコード:", encoding);
+  } catch (err) {
+    console.error("❌ ファイル再読み込み失敗:", err);
   }
 }
 
@@ -180,7 +199,17 @@ const insertTab = (e: KeyboardEvent) => {
     ></textarea>
   </main>
   <nav class="footer">
-    <div class="char-code">{{ charCode }}</div>
+    <div class="char-code" @click="onEncodingClick" ref="menuEncodingRef">
+      {{ charCode }}
+      <div v-if="isMenuEncoding" class="dropdown-encoding">
+          <div class="dropdown-item-encoding" @click="reOpenFile(path, 'utf-8')">
+            utf-8
+          </div>
+          <div class="dropdown-item-encoding" @click="reOpenFile(path, 'shift-jis')">
+            shift-jis
+          </div>
+      </div>
+    </div>
     <div class="path">{{ path }}</div>
   </nav>
 </template>
@@ -290,6 +319,28 @@ const insertTab = (e: KeyboardEvent) => {
   white-space: nowrap;
   padding: 0;
   margin: 0;
+}
+
+.dropdown-encoding {
+  width: 100px;
+  position: absolute;
+  bottom: 20px;
+  left: 0;
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  display: inline-block;
+  z-index: 100;
+}
+
+.dropdown-item-encoding {
+  width: 100px;
+  color: #ccc;
+  text-align: center;
+}
+
+.dropdown-item-encoding:hover {
+  background-color: #555;
+  color: #ffffff;
 }
 
 .path {
