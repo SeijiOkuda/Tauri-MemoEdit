@@ -64,9 +64,23 @@ async function saveFile() {
   }
   
   if (path.value) {
+    if(charCode.value && charCode.value !== "utf-8") {
+      const message = `現在のエンコードは${charCode.value}です。utf-8で保存しますか？`;
+      const okToSave = await ask(message, {
+        title: "確認",
+        kind: 'warning',
+        okLabel: "はい",
+        cancelLabel: "いいえ"
+      });
+      if (!okToSave) {
+        console.log("❌ 保存キャンセル");
+        return;
+      }
+    }
     try {
       await writeTextFile(path.value, text.value);
       textSaved.value = text.value;
+      charCode.value = "utf-8";
       console.log("✅ ファイル保存成功:", path.value);
     } catch (err) {
       console.error("❌ ファイル保存失敗:", err);
@@ -113,9 +127,15 @@ async function openFile(path: string) {
   }
 }
 
-async function reOpenFile(path: string, encoding: string) {
+async function reOpenFile(path: string | null, encoding: string) {
   try {
+    const okToReopen = await confirmIfUnsaved('reopen');
+    if (!okToReopen) return;
     charCode.value = encoding;
+    if (!path) {
+      console.log("❌ ファイルが開かれていません");
+      return;
+    }
     await openFile(path);
     console.log("✅ ファイル再読み込み成功:", path, "エンコード:", encoding);
   } catch (err) {
@@ -124,7 +144,7 @@ async function reOpenFile(path: string, encoding: string) {
 }
 
 async function exitApp() {
-  const okToExit = await confirmExitIfUnsaved();
+  const okToExit = await confirmIfUnsaved('exit');
   if (!okToExit) return;
 
   await exit()
@@ -133,9 +153,12 @@ async function exitApp() {
   });
 }
 
-async function confirmExitIfUnsaved(): Promise<boolean> {
+async function confirmIfUnsaved(action: 'exit' | 'reopen'): Promise<boolean> {
   if (text.value !== textSaved.value) {
-    return await ask("変更が保存されていません。終了しますか？", {
+    const message = action === 'exit' 
+      ? "変更が保存されていません。終了しますか？" 
+      : "変更が保存されていません。保存せずに再度開き直しますか？";
+    return await ask(message, {
       title: "確認",
       kind: 'warning',
       okLabel: "はい",
