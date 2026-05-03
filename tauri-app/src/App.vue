@@ -100,6 +100,37 @@ onMounted(async () => {
   const user = await invoke<AuthUser | null>('get_auth_user');
   if (user) authUser.value = user;
 
+  // クラウド専用タブをセッション復元
+  if (user) {
+    try {
+      const token = await invoke<string | null>('get_access_token');
+      if (token) {
+        const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
+        for (const entry of mappings.cloud_only) {
+          try {
+            const content = await invoke<string>('drive_get_file_content', {
+              fileId: entry.drive_file_id,
+              accessToken: token,
+            });
+            const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+            const tab = blankTab ?? createTab();
+            if (!blankTab) tabs.value.push(tab);
+            tab.text = content;
+            tab.textSaved = content;
+            tab.driveFileId = entry.drive_file_id;
+            tab.cloudSync = true;
+            tab.cloudStatus = 'synced';
+          } catch {
+            // Driveから削除されていた場合はマッピングも削除
+            await invoke('mapping_remove_cloud_only', { driveFileId: entry.drive_file_id });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('セッション復元失敗:', err);
+    }
+  }
+
   // 認証イベントを購読
   unlistenAuth = await listen<AuthUser>('auth-complete', (event) => {
     authUser.value = event.payload;
@@ -145,8 +176,9 @@ async function initCloudForTab(tab: Tab) {
     const token = await invoke<string | null>('get_access_token');
     if (!token) return;
     tab.cloudStatus = 'syncing';
+    const name = generateTimestampFilename();
     const file = await invoke<{ id: string }>('drive_create_file', {
-      name: generateTimestampFilename(),
+      name,
       content: tab.text,
       accessToken: token,
     });
@@ -154,6 +186,13 @@ async function initCloudForTab(tab: Tab) {
     tab.cloudSync = true;
     tab.textSaved = tab.text;
     tab.cloudStatus = 'synced';
+
+    // マッピングを保存
+    if (tab.path) {
+      await invoke('mapping_set_local', { localPath: tab.path, driveFileId: file.id });
+    } else {
+      await invoke('mapping_add_cloud_only', { driveFileId: file.id, name });
+    }
   } catch (err) {
     tab.cloudStatus = 'error';
     console.error('Drive file creation failed:', err);
@@ -203,6 +242,12 @@ async function disableCloudSync(tab: Tab) {
       if (token) await invoke('drive_delete_file', { fileId: tab.driveFileId, accessToken: token });
     } catch (err) {
       console.error('Drive delete failed:', err);
+    }
+    // マッピングを削除
+    if (tab.path) {
+      await invoke('mapping_remove_local', { localPath: tab.path });
+    } else {
+      await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
     }
   }
   tab.driveFileId = null;
@@ -274,6 +319,15 @@ async function openFileInTab(filePath: string) {
   try {
     await loadFileIntoTab(tab, filePath);
     activeTabId.value = tab.id;
+
+    // マッピングからDriveの紐づけを復元
+    const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
+    const driveId = mappings.local[filePath];
+    if (driveId) {
+      tab.driveFileId = driveId;
+      tab.cloudSync = true;
+      tab.cloudStatus = 'synced';
+    }
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
     if (!isBlank) tabs.value = tabs.value.filter(t => t.id !== tab.id);
@@ -282,6 +336,7 @@ async function openFileInTab(filePath: string) {
 
 async function saveFile() {
   const tab = activeTab.value;
+  const wasCloudOnly = tab.cloudSync && !tab.path;
   if (!tab.path) {
     const newPath = await save({
       filters: [{ name: 'Text Files', extensions: ['txt'] }],
@@ -289,6 +344,11 @@ async function saveFile() {
     });
     if (!newPath) return;
     tab.path = newPath;
+    // クラウド専用→ローカル+クラウドに昇格: マッピングを更新
+    if (wasCloudOnly && tab.driveFileId) {
+      await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
+      await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
+    }
   }
 
   if (tab.charCode !== "utf-8") {

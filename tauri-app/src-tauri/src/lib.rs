@@ -1,5 +1,6 @@
 mod auth;
 mod drive;
+mod mappings;
 
 use auth::{AuthState, AuthStateMutex, OAuthConfig, OAuthConfigMutex};
 use tauri::{Emitter, Manager, Window, WindowEvent};
@@ -64,6 +65,12 @@ pub fn run() {
             drive::drive_create_file,
             drive::drive_update_file,
             drive::drive_delete_file,
+            drive::drive_get_file_content,
+            mappings::mapping_set_local,
+            mappings::mapping_remove_local,
+            mappings::mapping_add_cloud_only,
+            mappings::mapping_remove_cloud_only,
+            mappings::mapping_get_all,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

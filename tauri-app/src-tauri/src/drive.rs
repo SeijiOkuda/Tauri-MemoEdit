@@ -86,6 +86,38 @@ pub async fn drive_update_file(
 }
 
 // -----------------------------------------------------------------------
+// ファイル内容取得
+// -----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn drive_get_file_content(
+    file_id: String,
+    access_token: String,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+            file_id
+        ))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        return resp.text().await.map_err(|e| e.to_string());
+    }
+
+    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+    Err(format!(
+        "Drive get error: {}",
+        json.get("error").unwrap_or(&serde_json::Value::Null)
+    ))
+}
+
+// -----------------------------------------------------------------------
 // ファイル削除
 // -----------------------------------------------------------------------
 
