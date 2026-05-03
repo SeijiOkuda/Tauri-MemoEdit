@@ -1,10 +1,17 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed, nextTick } from "vue";
+import { onMounted, onUnmounted, ref, computed, nextTick, watch } from "vue";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
-import { listen } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from '@tauri-apps/plugin-opener';
+
+interface AuthUser {
+  name: string;
+  email: string;
+  picture: string | null;
+}
 
 interface Tab {
   id: string;
@@ -12,11 +19,14 @@ interface Tab {
   textSaved: string;
   path: string | null;
   charCode: string;
+  driveFileId: string | null;
+  cloudSync: boolean;
+  cloudStatus: 'synced' | 'syncing' | 'error' | 'none';
 }
 
 let nextId = 1;
 function createTab(): Tab {
-  return { id: String(nextId++), text: "", textSaved: "", path: null, charCode: "utf-8" };
+  return { id: String(nextId++), text: "", textSaved: "", path: null, charCode: "utf-8", driveFileId: null, cloudSync: false, cloudStatus: 'none' };
 }
 
 const tabs = ref<Tab[]>([createTab()]);
@@ -25,9 +35,24 @@ const activeTab = computed(() => tabs.value.find(t => t.id === activeTabId.value
 
 const isMenuFile = ref(false);
 const isMenuEncoding = ref(false);
+const isMenuAuth = ref(false);
 const menuRef = ref<HTMLElement | null>(null);
 const menuEncodingRef = ref<HTMLElement | null>(null);
+const menuAuthRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
+const authUser = ref<AuthUser | null>(null);
+
+// クラウド同期
+const cloudSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const tabContextMenu = ref<{ tab: Tab; x: number; y: number } | null>(null);
+
+// セットアップウィザード
+const showSetupWizard = ref(false);
+const setupStep = ref(1);
+const setupClientId = ref('');
+const setupClientSecret = ref('');
+const setupSaving = ref(false);
+const setupError = ref('');
 
 function tabName(tab: Tab) {
   if (tab.path) return tab.path.split(/[\\/]/).pop() ?? tab.path;
@@ -59,6 +84,9 @@ async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "u
   tab.textSaved = content;
 }
 
+let unlistenAuth: UnlistenFn | null = null;
+let unlistenAuthExpired: UnlistenFn | null = null;
+
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
     await openFileInTab(event.payload);
@@ -66,6 +94,18 @@ onMounted(async () => {
 
   await listen("app-close-requested", async () => {
     exitApp();
+  });
+
+  // 保存済みの認証状態を復元
+  const user = await invoke<AuthUser | null>('get_auth_user');
+  if (user) authUser.value = user;
+
+  // 認証イベントを購読
+  unlistenAuth = await listen<AuthUser>('auth-complete', (event) => {
+    authUser.value = event.payload;
+  });
+  unlistenAuthExpired = await listen('auth-expired', () => {
+    authUser.value = null;
   });
 
   window.addEventListener("keydown", handleKeyDown);
@@ -77,6 +117,8 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown);
   window.removeEventListener('click', handleClickOutside);
+  unlistenAuth?.();
+  unlistenAuthExpired?.();
 });
 
 function handleClickOutside(e: MouseEvent) {
@@ -85,6 +127,139 @@ function handleClickOutside(e: MouseEvent) {
   }
   if (menuEncodingRef.value && !menuEncodingRef.value.contains(e.target as Node)) {
     isMenuEncoding.value = false;
+  }
+  if (menuAuthRef.value && !menuAuthRef.value.contains(e.target as Node)) {
+    isMenuAuth.value = false;
+  }
+  tabContextMenu.value = null;
+}
+
+function generateTimestampFilename(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.txt`;
+}
+
+async function initCloudForTab(tab: Tab) {
+  try {
+    const token = await invoke<string | null>('get_access_token');
+    if (!token) return;
+    tab.cloudStatus = 'syncing';
+    const file = await invoke<{ id: string }>('drive_create_file', {
+      name: generateTimestampFilename(),
+      content: tab.text,
+      accessToken: token,
+    });
+    tab.driveFileId = file.id;
+    tab.cloudSync = true;
+    tab.textSaved = tab.text;
+    tab.cloudStatus = 'synced';
+  } catch (err) {
+    tab.cloudStatus = 'error';
+    console.error('Drive file creation failed:', err);
+  }
+}
+
+function scheduleCloudSync(tab: Tab) {
+  const existing = cloudSyncTimers.get(tab.id);
+  if (existing) clearTimeout(existing);
+  tab.cloudStatus = 'syncing';
+  const timer = setTimeout(async () => {
+    cloudSyncTimers.delete(tab.id);
+    await syncTabToCloud(tab);
+  }, 10000);
+  cloudSyncTimers.set(tab.id, timer);
+}
+
+async function syncTabToCloud(tab: Tab) {
+  if (!tab.driveFileId || !tab.cloudSync) return;
+  try {
+    const token = await invoke<string | null>('get_access_token');
+    if (!token) { tab.cloudStatus = 'error'; return; }
+    await invoke('drive_update_file', {
+      fileId: tab.driveFileId,
+      content: tab.text,
+      accessToken: token,
+    });
+    tab.textSaved = tab.text;
+    tab.cloudStatus = 'synced';
+  } catch (err) {
+    tab.cloudStatus = 'error';
+    console.error('Cloud sync failed:', err);
+  }
+}
+
+function showTabContextMenu(tab: Tab, event: MouseEvent) {
+  tabContextMenu.value = { tab, x: event.clientX, y: event.clientY };
+}
+
+async function disableCloudSync(tab: Tab) {
+  tabContextMenu.value = null;
+  const timer = cloudSyncTimers.get(tab.id);
+  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tab.id); }
+  if (tab.driveFileId) {
+    try {
+      const token = await invoke<string | null>('get_access_token');
+      if (token) await invoke('drive_delete_file', { fileId: tab.driveFileId, accessToken: token });
+    } catch (err) {
+      console.error('Drive delete failed:', err);
+    }
+  }
+  tab.driveFileId = null;
+  tab.cloudSync = false;
+  tab.cloudStatus = 'none';
+}
+
+async function enableCloudSync(tab: Tab) {
+  tabContextMenu.value = null;
+  await initCloudForTab(tab);
+}
+
+async function loginGoogle() {
+  const config = await invoke<{ client_id: string; client_secret: string }>('get_oauth_config');
+  if (!config.client_id) {
+    setupClientId.value = '';
+    setupClientSecret.value = '';
+    setupError.value = '';
+    setupStep.value = 1;
+    showSetupWizard.value = true;
+    return;
+  }
+  try {
+    await invoke('start_google_auth');
+  } catch (err) {
+    await ask(String(err), { title: "ログインエラー", kind: 'error', okLabel: "OK", cancelLabel: "OK" });
+  }
+}
+
+async function logoutGoogle() {
+  await invoke('sign_out');
+  authUser.value = null;
+  isMenuAuth.value = false;
+}
+
+async function saveOAuthSetup() {
+  setupError.value = '';
+  if (!setupClientId.value.trim() || !setupClientSecret.value.trim()) {
+    setupError.value = 'クライアントIDとシークレットを両方入力してください。';
+    return;
+  }
+  if (!setupClientId.value.includes('googleusercontent.com')) {
+    setupError.value = 'クライアントIDの形式が正しくありません。\n（例: 123456789-xxx.apps.googleusercontent.com）';
+    return;
+  }
+  setupSaving.value = true;
+  try {
+    await invoke('save_oauth_config', {
+      clientId: setupClientId.value.trim(),
+      clientSecret: setupClientSecret.value.trim(),
+    });
+    showSetupWizard.value = false;
+    await invoke('start_google_auth');
+  } catch (err) {
+    setupError.value = String(err);
+  } finally {
+    setupSaving.value = false;
   }
 }
 
@@ -172,18 +347,33 @@ async function exitApp() {
   await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
-function newTab() {
+async function newTab() {
   const tab = createTab();
   tabs.value.push(tab);
   activeTabId.value = tab.id;
   nextTick(() => textarea.value?.focus());
+  if (authUser.value) {
+    await initCloudForTab(tab);
+  }
 }
 
 async function closeTab(tabId: string) {
   const tab = tabs.value.find(t => t.id === tabId);
   if (!tab) return;
 
+  // クラウド専用タブでデバウンス待ちの場合は即座に同期してから閉じる
+  if (tab.cloudSync && !tab.path && cloudSyncTimers.has(tabId)) {
+    const timer = cloudSyncTimers.get(tabId)!;
+    clearTimeout(timer);
+    cloudSyncTimers.delete(tabId);
+    await syncTabToCloud(tab);
+  }
+
   if (!await confirmIfUnsaved('close', tab)) return;
+
+  // 残っているタイマーをクリア
+  const timer = cloudSyncTimers.get(tabId);
+  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tabId); }
 
   const idx = tabs.value.findIndex(t => t.id === tabId);
   tabs.value.splice(idx, 1);
@@ -192,10 +382,21 @@ async function closeTab(tabId: string) {
     const newT = createTab();
     tabs.value.push(newT);
     activeTabId.value = newT.id;
+    if (authUser.value) await initCloudForTab(newT);
   } else if (activeTabId.value === tabId) {
     activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)].id;
   }
 }
+
+watch(
+  () => activeTab.value?.text,
+  (newText, oldText) => {
+    if (newText === oldText) return;
+    const tab = activeTab.value;
+    if (!tab?.cloudSync || !tab.driveFileId) return;
+    scheduleCloudSync(tab);
+  }
+);
 
 const insertTab = (e: KeyboardEvent) => {
   if (textarea.value) {
@@ -229,6 +430,25 @@ const insertTab = (e: KeyboardEvent) => {
     </div>
     <div class="menu-item">編集(E)</div>
     <div class="menu-item">ヘルプ(H)</div>
+    <div class="menu-spacer"></div>
+    <div class="menu-auth" ref="menuAuthRef">
+      <button v-if="!authUser" class="auth-login-btn" @click="loginGoogle" title="Googleでログイン">
+        <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/>
+        </svg>
+        ログイン
+      </button>
+      <div v-else class="auth-user-btn" @click="isMenuAuth = !isMenuAuth" title="アカウント">
+        <img v-if="authUser.picture" :src="authUser.picture" class="auth-avatar" referrerpolicy="no-referrer" />
+        <span v-else class="auth-initial">{{ authUser.name.charAt(0) }}</span>
+        <div v-if="isMenuAuth" class="dropdown-auth">
+          <div class="auth-info-name">{{ authUser.name }}</div>
+          <div class="auth-info-email">{{ authUser.email }}</div>
+          <div class="dropdown-divider"></div>
+          <div class="dropdown-item" @click.stop="logoutGoogle">ログアウト</div>
+        </div>
+      </div>
+    </div>
   </nav>
   <div class="tab-bar">
     <div
@@ -237,7 +457,13 @@ const insertTab = (e: KeyboardEvent) => {
       class="tab"
       :class="{ active: tab.id === activeTabId }"
       @click="activeTabId = tab.id"
+      @contextmenu.prevent="showTabContextMenu(tab, $event)"
     >
+      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="'cloud-' + tab.cloudStatus" :title="tab.cloudStatus === 'synced' ? 'クラウド同期済み' : tab.cloudStatus === 'syncing' ? '同期中...' : '同期エラー'">
+        <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+        </svg>
+      </span>
       <span class="tab-name">{{ tabName(tab) }}{{ isUnsaved(tab) ? ' ●' : '' }}</span>
       <span class="tab-close" @click.stop="closeTab(tab.id)">×</span>
     </div>
@@ -254,6 +480,160 @@ const insertTab = (e: KeyboardEvent) => {
       autofocus
     ></textarea>
   </main>
+  <!-- タブ右クリックメニュー -->
+  <div v-if="tabContextMenu" class="tab-context-menu" :style="{ left: tabContextMenu.x + 'px', top: tabContextMenu.y + 'px' }">
+    <div v-if="tabContextMenu.tab.cloudSync" class="context-item" @click.stop="disableCloudSync(tabContextMenu.tab)">クラウド同期を解除</div>
+    <div v-else-if="authUser" class="context-item" @click.stop="enableCloudSync(tabContextMenu.tab)">クラウドに同期する</div>
+    <div class="context-item context-item-danger" @click.stop="closeTab(tabContextMenu.tab.id); tabContextMenu = null">タブを閉じる</div>
+  </div>
+
+  <!-- セットアップウィザード -->
+  <div v-if="showSetupWizard" class="wizard-overlay">
+    <div class="wizard-modal">
+
+      <!-- ステップインジケーター -->
+      <div class="wizard-steps">
+        <div v-for="i in 5" :key="i" :class="['wizard-step-dot', { active: setupStep === i, done: setupStep > i }]"></div>
+      </div>
+      <div class="wizard-step-label">ステップ {{ setupStep }} / 5</div>
+
+      <!-- ステップ 1: はじめに -->
+      <div v-if="setupStep === 1" class="wizard-content">
+        <div class="wizard-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="#4285f4">
+            <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+          </svg>
+        </div>
+        <h2 class="wizard-title">Google Drive 連携の設定</h2>
+        <p class="wizard-desc">このアプリでメモをGoogle Driveに自動保存するには、Googleの開発者設定が一度だけ必要です。</p>
+        <p class="wizard-desc">5つのステップで完了します。所要時間は約5〜10分です。</p>
+        <ul class="wizard-checklist">
+          <li>Google Cloudプロジェクトの作成</li>
+          <li>Google Drive APIの有効化</li>
+          <li>OAuth同意画面の設定</li>
+          <li>認証情報の作成</li>
+          <li>クライアントIDの入力</li>
+        </ul>
+      </div>
+
+      <!-- ステップ 2: プロジェクト作成 -->
+      <div v-if="setupStep === 2" class="wizard-content">
+        <h2 class="wizard-title">Google Cloudプロジェクトを作成する</h2>
+        <p class="wizard-desc">Googleのサービスを利用するために、無料の「Google Cloudプロジェクト」が必要です。</p>
+        <ol class="wizard-steps-list">
+          <li>下のボタンをクリックしてGoogle Cloud Consoleを開く</li>
+          <li>ページ上部の「プロジェクトを選択」をクリック</li>
+          <li>右上の「新しいプロジェクト」をクリック</li>
+          <li>プロジェクト名を入力（例: MemoEdit）して「作成」をクリック</li>
+          <li>作成したプロジェクトが選択されていることを確認</li>
+        </ol>
+        <button class="wizard-link-btn" @click="openUrl('https://console.cloud.google.com/')">
+          Google Cloud Consoleを開く
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+        </button>
+      </div>
+
+      <!-- ステップ 3: Drive API有効化 -->
+      <div v-if="setupStep === 3" class="wizard-content">
+        <h2 class="wizard-title">Google Drive APIを有効にする</h2>
+        <p class="wizard-desc">メモをDriveに保存するために、Google Drive APIを有効にします。</p>
+        <ol class="wizard-steps-list">
+          <li>下のボタンをクリックしてGoogle Drive APIのページを開く</li>
+          <li>青い「有効にする」ボタンをクリック</li>
+          <li>「APIが有効になりました」と表示されれば完了</li>
+        </ol>
+        <button class="wizard-link-btn" @click="openUrl('https://console.cloud.google.com/apis/library/drive.googleapis.com')">
+          Google Drive APIを有効にする
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+        </button>
+      </div>
+
+      <!-- ステップ 4: 認証情報作成 -->
+      <div v-if="setupStep === 4" class="wizard-content">
+        <h2 class="wizard-title">OAuth認証情報を作成する</h2>
+
+        <p class="wizard-section-title">4-1. 同意画面を設定する</p>
+        <ol class="wizard-steps-list">
+          <li>下のボタンから「OAuth同意画面」ページを開く</li>
+          <li>「外部」を選択して「作成」をクリック</li>
+          <li>アプリ名（例: MemoEdit）とサポートメールを入力→「保存して次へ」</li>
+          <li>スコープ・省略可能の情報はそのまま「保存して次へ」を2回クリック</li>
+          <li>「テストユーザー」セクションで「+ ADD USERS」をクリック</li>
+          <li>ログインに使うGmailアドレスを入力して「追加」→「保存して次へ」</li>
+        </ol>
+        <div class="wizard-alert">
+          テストユーザーへの追加を忘れると「アクセスをブロック」エラーが発生します。
+          必ず自分のGmailアドレスを追加してください。
+        </div>
+        <button class="wizard-link-btn" @click="openUrl('https://console.cloud.google.com/apis/auth/consent')">
+          OAuth同意画面を開く
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+        </button>
+
+        <p class="wizard-section-title" style="margin-top:12px">4-2. 認証情報（クライアントID）を作成する</p>
+        <ol class="wizard-steps-list">
+          <li>下のボタンから「認証情報」ページを開く</li>
+          <li>「認証情報を作成」→「OAuthクライアントID」をクリック</li>
+          <li>アプリの種類:「デスクトップ アプリ」を選択</li>
+          <li>名前は任意（例: MemoEdit）→「作成」をクリック</li>
+          <li>表示された「クライアントID」と「クライアントシークレット」をコピーしておく</li>
+        </ol>
+        <button class="wizard-link-btn" @click="openUrl('https://console.cloud.google.com/apis/credentials')">
+          認証情報ページを開く
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+        </button>
+      </div>
+
+      <!-- ステップ 5: 情報入力 -->
+      <div v-if="setupStep === 5" class="wizard-content">
+        <h2 class="wizard-title">クライアント情報を入力する</h2>
+        <p class="wizard-desc">前のステップで作成した認証情報を入力してください。</p>
+        <div class="wizard-form">
+          <label class="wizard-label">
+            クライアントID
+            <input
+              v-model="setupClientId"
+              class="wizard-input"
+              placeholder="123456789-xxx.apps.googleusercontent.com"
+              spellcheck="false"
+            />
+          </label>
+          <label class="wizard-label">
+            クライアントシークレット
+            <input
+              v-model="setupClientSecret"
+              class="wizard-input"
+              type="password"
+              placeholder="GOCSPX-..."
+              spellcheck="false"
+            />
+          </label>
+          <p v-if="setupError" class="wizard-error">{{ setupError }}</p>
+        </div>
+      </div>
+
+      <!-- ナビゲーション -->
+      <div class="wizard-nav">
+        <button class="wizard-btn-secondary" @click="showSetupWizard = false">キャンセル</button>
+        <div class="wizard-nav-right">
+          <button v-if="setupStep > 1" class="wizard-btn-secondary" @click="setupStep--">戻る</button>
+          <button
+            v-if="setupStep < 5"
+            class="wizard-btn-primary"
+            @click="setupStep++"
+          >次へ</button>
+          <button
+            v-else
+            class="wizard-btn-primary"
+            @click="saveOAuthSetup"
+            :disabled="setupSaving"
+          >{{ setupSaving ? '保存中...' : 'ログインする' }}</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <nav class="footer">
     <div class="char-code" @click="onEncodingClick" ref="menuEncodingRef">
       {{ activeTab.charCode }}
@@ -487,6 +867,376 @@ const insertTab = (e: KeyboardEvent) => {
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0 0 0 10px;
+  margin: 0;
+}
+
+/* Cloud sync status icons */
+.tab-cloud-icon {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.cloud-synced {
+  color: #5cb85c;
+}
+
+.cloud-syncing {
+  color: #4da6ff;
+  animation: cloud-pulse 1.4s ease-in-out infinite;
+}
+
+.cloud-error {
+  color: #e05555;
+}
+
+@keyframes cloud-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Tab context menu */
+.tab-context-menu {
+  position: fixed;
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  z-index: 500;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+
+.context-item {
+  padding: 7px 14px;
+  color: #ccc;
+  font-size: small;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.context-item:hover {
+  background: #094771;
+  color: #fff;
+}
+
+.context-item-danger:hover {
+  background: #6e1c1c;
+  color: #fff;
+}
+
+/* Setup Wizard */
+.wizard-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.wizard-modal {
+  background: #1e1e2e;
+  border: 1px solid #3c3c5c;
+  border-radius: 8px;
+  width: 520px;
+  max-width: 90vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  padding: 28px 32px 24px;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.wizard-steps {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.wizard-step-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #444;
+  transition: background 0.2s;
+}
+
+.wizard-step-dot.active {
+  background: #0078d4;
+}
+
+.wizard-step-dot.done {
+  background: #0a8a3a;
+}
+
+.wizard-step-label {
+  text-align: center;
+  font-size: 11px;
+  color: #888;
+  margin-top: -8px;
+}
+
+.wizard-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wizard-icon {
+  text-align: center;
+}
+
+.wizard-title {
+  color: #f6f6f6;
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.wizard-desc {
+  color: #bbb;
+  font-size: 0.88rem;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.wizard-checklist {
+  color: #ccc;
+  font-size: 0.85rem;
+  padding-left: 1.4rem;
+  margin: 0;
+  line-height: 2;
+}
+
+.wizard-steps-list {
+  color: #ccc;
+  font-size: 0.85rem;
+  padding-left: 1.4rem;
+  margin: 0;
+  line-height: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wizard-note {
+  background: #2a2a1e;
+  border-left: 3px solid #c8a000;
+  padding: 8px 12px;
+  color: #e0c060;
+  font-size: 0.82rem;
+  line-height: 1.7;
+  list-style: none;
+  margin-left: -1.4rem;
+}
+
+.wizard-section-title {
+  color: #f6f6f6;
+  font-size: 0.88rem;
+  font-weight: bold;
+  margin: 0;
+}
+
+.wizard-alert {
+  background: #2a1e1e;
+  border-left: 3px solid #e05555;
+  padding: 10px 14px;
+  color: #f08080;
+  font-size: 0.83rem;
+  line-height: 1.6;
+}
+
+.wizard-link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #0078d4;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.wizard-link-btn:hover {
+  background: #006bb5;
+}
+
+.wizard-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wizard-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #ccc;
+  font-size: 0.85rem;
+}
+
+.wizard-input {
+  background: #2a2a3a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #f6f6f6;
+  font-size: 0.85rem;
+  padding: 8px 10px;
+  outline: none;
+  font-family: 'Fira Mono', 'Consolas', monospace;
+}
+
+.wizard-input:focus {
+  border-color: #0078d4;
+}
+
+.wizard-error {
+  color: #e05555;
+  font-size: 0.82rem;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.wizard-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid #333;
+}
+
+.wizard-nav-right {
+  display: flex;
+  gap: 8px;
+}
+
+.wizard-btn-primary {
+  background: #0078d4;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 7px 20px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.wizard-btn-primary:hover:not(:disabled) {
+  background: #006bb5;
+}
+
+.wizard-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.wizard-btn-secondary {
+  background: none;
+  color: #aaa;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 7px 16px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.wizard-btn-secondary:hover {
+  background: #333;
+  color: #eee;
+}
+
+/* Auth */
+.menu-spacer {
+  flex: 1;
+}
+
+.menu-auth {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 6px;
+  position: relative;
+}
+
+.auth-login-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid #888;
+  border-radius: 3px;
+  color: #f6f6f6;
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+  height: 16px;
+  line-height: 1;
+}
+
+.auth-login-btn:hover {
+  background: #666;
+}
+
+.auth-user-btn {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  position: relative;
+}
+
+.auth-avatar {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.auth-initial {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #0078d4;
+  color: #fff;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dropdown-auth {
+  position: absolute;
+  top: 20px;
+  right: 0;
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  min-width: 180px;
+  z-index: 200;
+}
+
+.auth-info-name {
+  padding: 8px 12px 2px;
+  color: #f6f6f6;
+  font-size: small;
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.auth-info-email {
+  padding: 0 12px 8px;
+  color: #aaa;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dropdown-divider {
+  border-top: 1px solid #3c3c3c;
   margin: 0;
 }
 </style>
