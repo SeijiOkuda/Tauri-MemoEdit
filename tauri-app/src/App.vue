@@ -7,6 +7,15 @@ import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from '@tauri-apps/plugin-opener';
 
+type DiffLineType = 'same' | 'local-only' | 'drive-only';
+interface DiffLine { text: string; type: DiffLineType; }
+interface ConflictDialogData {
+  tab: Tab;
+  localContent: string;
+  driveContent: string;
+  resolve: (choice: 'local' | 'drive') => void;
+}
+
 interface AuthUser {
   name: string;
   email: string;
@@ -45,6 +54,11 @@ const authUser = ref<AuthUser | null>(null);
 // クラウド同期
 const cloudSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const tabContextMenu = ref<{ tab: Tab; x: number; y: number } | null>(null);
+const conflictDialog = ref<ConflictDialogData | null>(null);
+const diffResult = computed(() => {
+  if (!conflictDialog.value) return { local: [] as DiffLine[], drive: [] as DiffLine[] };
+  return computeDiff(conflictDialog.value.localContent, conflictDialog.value.driveContent);
+});
 
 // セットアップウィザード
 const showSetupWizard = ref(false);
@@ -165,6 +179,56 @@ function handleClickOutside(e: MouseEvent) {
   tabContextMenu.value = null;
 }
 
+// -----------------------------------------------------------------------
+// LCSベースの行差分計算
+// -----------------------------------------------------------------------
+function computeDiff(localText: string, driveText: string): { local: DiffLine[]; drive: DiffLine[] } {
+  const a = localText.split('\n');
+  const b = driveText.split('\n');
+  const m = a.length;
+  const n = b.length;
+
+  // LCS DPテーブル
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+    }
+  }
+
+  // バックトラック
+  const localLines: DiffLine[] = [];
+  const driveLines: DiffLine[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i-1] === b[j-1]) {
+      localLines.unshift({ text: a[i-1], type: 'same' });
+      driveLines.unshift({ text: b[j-1], type: 'same' });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+      driveLines.unshift({ text: b[j-1], type: 'drive-only' });
+      j--;
+    } else {
+      localLines.unshift({ text: a[i-1], type: 'local-only' });
+      i--;
+    }
+  }
+  return { local: localLines, drive: driveLines };
+}
+
+function showConflictDialog(tab: Tab, localContent: string, driveContent: string): Promise<'local' | 'drive'> {
+  return new Promise((resolve) => {
+    conflictDialog.value = { tab, localContent, driveContent, resolve };
+  });
+}
+
+function resolveConflict(choice: 'local' | 'drive') {
+  if (!conflictDialog.value) return;
+  conflictDialog.value.resolve(choice);
+  conflictDialog.value = null;
+}
+
+// -----------------------------------------------------------------------
 function generateTimestampFilename(): string {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -320,10 +384,29 @@ async function openFileInTab(filePath: string) {
     await loadFileIntoTab(tab, filePath);
     activeTabId.value = tab.id;
 
-    // マッピングからDriveの紐づけを復元
+    // マッピングからDriveの紐づけを復元し、競合チェック
     const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
     const driveId = mappings.local[filePath];
     if (driveId) {
+      try {
+        const token = await invoke<string | null>('get_access_token');
+        if (token) {
+          const driveContent = await invoke<string>('drive_get_file_content', {
+            fileId: driveId,
+            accessToken: token,
+          });
+          if (driveContent !== tab.text) {
+            // 差分あり → 競合ダイアログ
+            const choice = await showConflictDialog(tab, tab.text, driveContent);
+            if (choice === 'drive') {
+              tab.text = driveContent;
+              tab.textSaved = driveContent;
+            }
+          }
+        }
+      } catch (err) {
+        console.error('競合チェック失敗:', err);
+      }
       tab.driveFileId = driveId;
       tab.cloudSync = true;
       tab.cloudStatus = 'synced';
@@ -540,6 +623,44 @@ const insertTab = (e: KeyboardEvent) => {
       autofocus
     ></textarea>
   </main>
+  <!-- 競合ダイアログ -->
+  <div v-if="conflictDialog" class="conflict-overlay">
+    <div class="conflict-modal">
+      <div class="conflict-header">
+        <h2 class="conflict-title">競合が検出されました</h2>
+        <p class="conflict-subtitle">{{ conflictDialog.tab.path ?? 'クラウドファイル' }} のローカル版とDrive版の内容が異なります。使用するバージョンを選んでください。</p>
+        <div class="conflict-legend">
+          <span class="legend-local">■ ローカルのみの行</span>
+          <span class="legend-drive">■ Driveのみの行</span>
+        </div>
+      </div>
+      <div class="conflict-panels">
+        <div class="conflict-panel">
+          <div class="conflict-panel-header">ローカル版 <span class="conflict-line-count">{{ diffResult.local.length }}行</span></div>
+          <div class="diff-view">
+            <div v-for="(line, idx) in diffResult.local" :key="idx" :class="['diff-line', 'diff-' + line.type]">
+              <span class="diff-ln">{{ idx + 1 }}</span>
+              <span class="diff-text">{{ line.text }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="conflict-panel">
+          <div class="conflict-panel-header">Drive版 <span class="conflict-line-count">{{ diffResult.drive.length }}行</span></div>
+          <div class="diff-view">
+            <div v-for="(line, idx) in diffResult.drive" :key="idx" :class="['diff-line', 'diff-' + line.type]">
+              <span class="diff-ln">{{ idx + 1 }}</span>
+              <span class="diff-text">{{ line.text }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="conflict-actions">
+        <button class="conflict-btn conflict-btn-local" @click="resolveConflict('local')">ローカル版を使用</button>
+        <button class="conflict-btn conflict-btn-drive" @click="resolveConflict('drive')">Drive版を使用</button>
+      </div>
+    </div>
+  </div>
+
   <!-- タブ右クリックメニュー -->
   <div v-if="tabContextMenu" class="tab-context-menu" :style="{ left: tabContextMenu.x + 'px', top: tabContextMenu.y + 'px' }">
     <div v-if="tabContextMenu.tab.cloudSync" class="context-item" @click.stop="disableCloudSync(tabContextMenu.tab)">クラウド同期を解除</div>
@@ -929,6 +1050,163 @@ const insertTab = (e: KeyboardEvent) => {
   padding: 0 0 0 10px;
   margin: 0;
 }
+
+/* Conflict dialog */
+.conflict-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.conflict-modal {
+  background: #1e1e2e;
+  border: 1px solid #3c3c5c;
+  border-radius: 8px;
+  width: 90vw;
+  max-width: 1000px;
+  height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.conflict-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.conflict-title {
+  color: #f6f6f6;
+  font-size: 1rem;
+  margin: 0 0 4px;
+}
+
+.conflict-subtitle {
+  color: #aaa;
+  font-size: 0.82rem;
+  margin: 0 0 8px;
+}
+
+.conflict-legend {
+  display: flex;
+  gap: 16px;
+  font-size: 0.78rem;
+}
+
+.legend-local { color: #e07070; }
+.legend-drive { color: #70c070; }
+
+.conflict-panels {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  gap: 1px;
+  background: #333;
+}
+
+.conflict-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #1e1e2e;
+}
+
+.conflict-panel-header {
+  padding: 6px 12px;
+  background: #252536;
+  color: #ccc;
+  font-size: 0.82rem;
+  font-weight: bold;
+  flex-shrink: 0;
+  border-bottom: 1px solid #333;
+}
+
+.conflict-line-count {
+  color: #888;
+  font-weight: normal;
+  margin-left: 6px;
+}
+
+.diff-view {
+  flex: 1;
+  overflow-y: auto;
+  font-family: 'Fira Mono', 'Consolas', monospace;
+  font-size: 0.8rem;
+}
+
+.diff-line {
+  display: flex;
+  align-items: baseline;
+  min-height: 1.4em;
+  padding: 1px 0;
+}
+
+.diff-line.diff-local-only {
+  background: rgba(200, 60, 60, 0.25);
+}
+
+.diff-line.diff-drive-only {
+  background: rgba(60, 180, 60, 0.2);
+}
+
+.diff-ln {
+  width: 40px;
+  min-width: 40px;
+  text-align: right;
+  padding-right: 10px;
+  color: #555;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.diff-text {
+  color: #d4d4d4;
+  white-space: pre;
+  word-break: break-all;
+}
+
+.diff-line.diff-local-only .diff-text { color: #f08080; }
+.diff-line.diff-drive-only .diff-text { color: #80d080; }
+
+.conflict-actions {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  padding: 14px 20px;
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.conflict-btn {
+  padding: 8px 28px;
+  border: none;
+  border-radius: 4px;
+  font-size: 0.88rem;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.conflict-btn-local {
+  background: #5a2020;
+  color: #f08080;
+  border: 1px solid #8a3030;
+}
+
+.conflict-btn-local:hover { background: #6e2626; }
+
+.conflict-btn-drive {
+  background: #1a4a1a;
+  color: #80d080;
+  border: 1px solid #2a6a2a;
+}
+
+.conflict-btn-drive:hover { background: #1e5a1e; }
 
 /* Cloud sync status icons */
 .tab-cloud-icon {
