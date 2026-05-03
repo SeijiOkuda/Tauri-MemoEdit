@@ -60,6 +60,23 @@ const diffResult = computed(() => {
   return computeDiff(conflictDialog.value.localContent, conflictDialog.value.driveContent);
 });
 
+// セッション永続化
+const SESSION_KEY = 'memo-edit-tab-session';
+interface SavedTab { path: string; charCode: string; }
+interface TabSession { localTabs: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
+function saveTabSession() {
+  const localTabs: SavedTab[] = tabs.value
+    .filter(t => t.path !== null)
+    .map(t => ({ path: t.path!, charCode: t.charCode }));
+  const active = activeTab.value;
+  const session: TabSession = {
+    localTabs,
+    activeTabPath: active?.path ?? null,
+    activeTabDriveId: (!active?.path && active?.driveFileId) ? active.driveFileId : null,
+  };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
 // セットアップウィザード
 const showSetupWizard = ref(false);
 const setupStep = ref(1);
@@ -114,6 +131,13 @@ onMounted(async () => {
   const user = await invoke<AuthUser | null>('get_auth_user');
   if (user) authUser.value = user;
 
+  // セッションデータを読み込み
+  const sessionStr = localStorage.getItem(SESSION_KEY);
+  let savedSession: TabSession | null = null;
+  if (sessionStr) {
+    try { savedSession = JSON.parse(sessionStr); } catch {}
+  }
+
   // クラウド専用タブをセッション復元
   if (user) {
     try {
@@ -141,8 +165,33 @@ onMounted(async () => {
         }
       }
     } catch (err) {
-      console.error('セッション復元失敗:', err);
+      console.error('クラウド専用タブ復元失敗:', err);
     }
+  }
+
+  // ローカルタブをセッション復元
+  if (savedSession?.localTabs?.length) {
+    for (const st of savedSession.localTabs) {
+      try {
+        await openFileInTab(st.path);
+        const tab = tabs.value.find(t => t.path === st.path);
+        if (tab && st.charCode !== 'utf-8') tab.charCode = st.charCode;
+      } catch {
+        // ファイルが見つからない場合はスキップ
+      }
+    }
+  }
+
+  // アクティブタブを復元
+  if (savedSession) {
+    if (savedSession.activeTabPath) {
+      const restoredActive = tabs.value.find(t => t.path === savedSession!.activeTabPath);
+      if (restoredActive) activeTabId.value = restoredActive.id;
+    } else if (savedSession.activeTabDriveId) {
+      const restoredActive = tabs.value.find(t => t.driveFileId === savedSession!.activeTabDriveId);
+      if (restoredActive) activeTabId.value = restoredActive.id;
+    }
+    saveTabSession();
   }
 
   // 認証イベントを購読
@@ -411,6 +460,7 @@ async function openFileInTab(filePath: string) {
       tab.cloudSync = true;
       tab.cloudStatus = 'synced';
     }
+    saveTabSession();
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
     if (!isBlank) tabs.value = tabs.value.filter(t => t.id !== tab.id);
@@ -487,6 +537,7 @@ async function reOpenFile(tab: Tab, encoding: string) {
 
 async function exitApp() {
   if (!await confirmIfUnsaved('exit')) return;
+  saveTabSession();
   await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
@@ -529,6 +580,7 @@ async function closeTab(tabId: string) {
   } else if (activeTabId.value === tabId) {
     activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)].id;
   }
+  saveTabSession();
 }
 
 watch(
