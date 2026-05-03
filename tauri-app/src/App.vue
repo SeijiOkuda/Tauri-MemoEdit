@@ -1,44 +1,77 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, nextTick } from "vue";
+import { onMounted, onUnmounted, ref, computed, nextTick } from "vue";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 
-const text = ref("");
-const textSaved = ref("");
-const isMenuFile = ref<boolean>(false);
-const isMenuEncoding = ref<boolean>(false);
-const path = ref<string | null>(null);
-const charCode = ref<string | null>("utf-8");
+interface Tab {
+  id: string;
+  text: string;
+  textSaved: string;
+  path: string | null;
+  charCode: string;
+}
 
+let nextId = 1;
+function createTab(): Tab {
+  return { id: String(nextId++), text: "", textSaved: "", path: null, charCode: "utf-8" };
+}
+
+const tabs = ref<Tab[]>([createTab()]);
+const activeTabId = ref(tabs.value[0].id);
+const activeTab = computed(() => tabs.value.find(t => t.id === activeTabId.value)!);
+
+const isMenuFile = ref(false);
+const isMenuEncoding = ref(false);
 const menuRef = ref<HTMLElement | null>(null);
 const menuEncodingRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 
+function tabName(tab: Tab) {
+  if (tab.path) return tab.path.split(/[\\/]/).pop() ?? tab.path;
+  return "新しいファイル";
+}
+
+function isUnsaved(tab: Tab) {
+  return tab.text !== tab.textSaved;
+}
+
+async function confirmIfUnsaved(action: 'exit' | 'reopen' | 'close', tab?: Tab): Promise<boolean> {
+  const hasUnsaved = action === 'exit'
+    ? tabs.value.some(isUnsaved)
+    : isUnsaved(tab ?? activeTab.value);
+  if (!hasUnsaved) return true;
+  const message = action === 'exit'
+    ? "変更が保存されていません。終了しますか？"
+    : action === 'reopen'
+    ? "変更が保存されていません。保存せずに再度開き直しますか？"
+    : "変更が保存されていません。タブを閉じますか？";
+  return await ask(message, {
+    title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
+  });
+}
+
+async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "utf-8") {
+  const content = await readTextFile(filePath, { encoding });
+  tab.text = content;
+  tab.textSaved = content;
+}
+
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
-    console.log("📂 外部起動ファイルイベント受信:", event.payload);
-    const filePath = event.payload;
-    path.value = filePath;
-
-    if (path.value) {
-      await openFile(path.value);
-    } else {
-      console.log("❌ ファイル選択キャンセル");
-    }
+    await openFileInTab(event.payload);
   });
 
   await listen("app-close-requested", async () => {
-    console.log("❌ アプリ閉じるリクエストを受信");
     exitApp();
   });
 
   window.addEventListener("keydown", handleKeyDown);
   window.addEventListener("click", handleClickOutside);
 
-  invoke("frontend_ready"); 
+  invoke("frontend_ready");
 });
 
 onUnmounted(() => {
@@ -55,38 +88,47 @@ function handleClickOutside(e: MouseEvent) {
   }
 }
 
+async function openFileInTab(filePath: string) {
+  const cur = activeTab.value;
+  const isBlank = !cur.path && cur.text === "" && !isUnsaved(cur);
+  const tab = isBlank ? cur : createTab();
+  if (!isBlank) tabs.value.push(tab);
+
+  tab.path = filePath;
+  tab.charCode = "utf-8";
+  try {
+    await loadFileIntoTab(tab, filePath);
+    activeTabId.value = tab.id;
+  } catch (err) {
+    console.error("❌ ファイル読み込み失敗:", err);
+    if (!isBlank) tabs.value = tabs.value.filter(t => t.id !== tab.id);
+  }
+}
+
 async function saveFile() {
-  if (!path.value) {
-    path.value = await save({
+  const tab = activeTab.value;
+  if (!tab.path) {
+    const newPath = await save({
       filters: [{ name: 'Text Files', extensions: ['txt'] }],
       defaultPath: 'memo.txt',
     });
+    if (!newPath) return;
+    tab.path = newPath;
   }
-  
-  if (path.value) {
-    if(charCode.value && charCode.value !== "utf-8") {
-      const message = `現在のエンコードは${charCode.value}です。utf-8で保存しますか？`;
-      const okToSave = await ask(message, {
-        title: "確認",
-        kind: 'warning',
-        okLabel: "はい",
-        cancelLabel: "いいえ"
-      });
-      if (!okToSave) {
-        console.log("❌ 保存キャンセル");
-        return;
-      }
-    }
-    try {
-      await writeTextFile(path.value, text.value);
-      textSaved.value = text.value;
-      charCode.value = "utf-8";
-      console.log("✅ ファイル保存成功:", path.value);
-    } catch (err) {
-      console.error("❌ ファイル保存失敗:", err);
-    }
-  } else {
-    console.log("❌ 保存キャンセル");
+
+  if (tab.charCode !== "utf-8") {
+    const ok = await ask(`現在のエンコードは${tab.charCode}です。utf-8で保存しますか？`, {
+      title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
+    });
+    if (!ok) return;
+  }
+
+  try {
+    await writeTextFile(tab.path, tab.text);
+    tab.textSaved = tab.text;
+    tab.charCode = "utf-8";
+  } catch (err) {
+    console.error("❌ ファイル保存失敗:", err);
   }
 }
 
@@ -106,74 +148,53 @@ function onEncodingClick() {
 }
 
 async function openFileDialog() {
-  path.value = await open({
+  const filePath = await open({
     filters: [{ name: 'Text Files', extensions: ['txt'] }],
   });
-  if (path.value) {
-    await openFile(path.value);
-  } else {
-    console.log("❌ ファイル選択キャンセル");
+  if (filePath) {
+    await openFileInTab(filePath as string);
   }
 }
 
-async function openFile(path: string) {
+async function reOpenFile(tab: Tab, encoding: string) {
+  if (!tab.path) return;
+  if (!await confirmIfUnsaved('reopen', tab)) return;
+  tab.charCode = encoding;
   try {
-    const fileContent = await readTextFile(path, { encoding: charCode.value? charCode.value : "utf-8" });
-    text.value = fileContent;
-    textSaved.value = fileContent;
-    console.log("✅ ファイル読み込み成功:", path);
-  } catch (err) {
-    console.error("❌ ファイル読み込み失敗:", err);
-  }
-}
-
-async function reOpenFile(path: string | null, encoding: string) {
-  try {
-    const okToReopen = await confirmIfUnsaved('reopen');
-    if (!okToReopen) return;
-    charCode.value = encoding;
-    if (!path) {
-      console.log("❌ ファイルが開かれていません");
-      return;
-    }
-    await openFile(path);
-    console.log("✅ ファイル再読み込み成功:", path, "エンコード:", encoding);
+    await loadFileIntoTab(tab, tab.path, encoding);
   } catch (err) {
     console.error("❌ ファイル再読み込み失敗:", err);
   }
 }
 
 async function exitApp() {
-  const okToExit = await confirmIfUnsaved('exit');
-  if (!okToExit) return;
-
-  await exit()
-  .catch(err => {
-    console.error("❌ アプリ終了失敗:", err);
-  });
+  if (!await confirmIfUnsaved('exit')) return;
+  await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
-async function confirmIfUnsaved(action: 'exit' | 'reopen'): Promise<boolean> {
-  if (text.value !== textSaved.value) {
-    const message = action === 'exit' 
-      ? "変更が保存されていません。終了しますか？" 
-      : "変更が保存されていません。保存せずに再度開き直しますか？";
-    return await ask(message, {
-      title: "確認",
-      kind: 'warning',
-      okLabel: "はい",
-      cancelLabel: "いいえ"
-    });
+function newTab() {
+  const tab = createTab();
+  tabs.value.push(tab);
+  activeTabId.value = tab.id;
+  nextTick(() => textarea.value?.focus());
+}
+
+async function closeTab(tabId: string) {
+  const tab = tabs.value.find(t => t.id === tabId);
+  if (!tab) return;
+
+  if (!await confirmIfUnsaved('close', tab)) return;
+
+  const idx = tabs.value.findIndex(t => t.id === tabId);
+  tabs.value.splice(idx, 1);
+
+  if (tabs.value.length === 0) {
+    const newT = createTab();
+    tabs.value.push(newT);
+    activeTabId.value = newT.id;
+  } else if (activeTabId.value === tabId) {
+    activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)].id;
   }
-  return true;
-}
-
-function onEditClick() {
-  console.log("編集メニューがクリックされました");
-}
-
-function onHelpClick() {
-  console.log("ヘルプメニューがクリックされました");
 }
 
 const insertTab = (e: KeyboardEvent) => {
@@ -182,7 +203,7 @@ const insertTab = (e: KeyboardEvent) => {
     const end = textarea.value.selectionEnd;
     const value = textarea.value.value;
 
-    text.value = value.substring(0, start) + "\t" + value.substring(end);
+    activeTab.value.text = value.substring(0, start) + "\t" + value.substring(end);
 
     nextTick(() => {
       if (textarea.value) {
@@ -193,7 +214,6 @@ const insertTab = (e: KeyboardEvent) => {
     e.preventDefault();
   }
 };
-
 </script>
 
 <template>
@@ -201,19 +221,32 @@ const insertTab = (e: KeyboardEvent) => {
     <div class="menu-item" @click="onFileClick" ref="menuRef">
       ファイル(F)
       <div v-if="isMenuFile" class="dropdown">
-        <div class="dropdown-item">新しいファイル</div>
+        <div class="dropdown-item" @click="newTab">新しいタブ</div>
         <div class="dropdown-item" @click="openFileDialog">開く</div>
         <div class="dropdown-item" @click="saveFile">保存</div>
         <div class="dropdown-item" @click="exitApp">終了</div>
       </div>
     </div>
-    <div class="menu-item" @click="onEditClick">編集(E)</div>
-    <div class="menu-item" @click="onHelpClick">ヘルプ(H)</div>
+    <div class="menu-item">編集(E)</div>
+    <div class="menu-item">ヘルプ(H)</div>
   </nav>
+  <div class="tab-bar">
+    <div
+      v-for="tab in tabs"
+      :key="tab.id"
+      class="tab"
+      :class="{ active: tab.id === activeTabId }"
+      @click="activeTabId = tab.id"
+    >
+      <span class="tab-name">{{ tabName(tab) }}{{ isUnsaved(tab) ? ' ●' : '' }}</span>
+      <span class="tab-close" @click.stop="closeTab(tab.id)">×</span>
+    </div>
+    <div class="tab-new" @click="newTab">+</div>
+  </div>
   <main class="fullscreen-container">
     <textarea
       ref="textarea"
-      v-model="text"
+      v-model="activeTab.text"
       class="cool-textarea"
       placeholder="ここにメモを入力..."
       @keydown.tab.prevent="insertTab"
@@ -223,17 +256,13 @@ const insertTab = (e: KeyboardEvent) => {
   </main>
   <nav class="footer">
     <div class="char-code" @click="onEncodingClick" ref="menuEncodingRef">
-      {{ charCode }}
+      {{ activeTab.charCode }}
       <div v-if="isMenuEncoding" class="dropdown-encoding">
-          <div class="dropdown-item-encoding" @click="reOpenFile(path, 'utf-8')">
-            utf-8
-          </div>
-          <div class="dropdown-item-encoding" @click="reOpenFile(path, 'shift-jis')">
-            shift-jis
-          </div>
+        <div class="dropdown-item-encoding" @click="reOpenFile(activeTab, 'utf-8')">utf-8</div>
+        <div class="dropdown-item-encoding" @click="reOpenFile(activeTab, 'shift-jis')">shift-jis</div>
       </div>
     </div>
-    <div class="path">{{ path }}</div>
+    <div class="path">{{ activeTab.path }}</div>
   </nav>
 </template>
 
@@ -241,7 +270,7 @@ const insertTab = (e: KeyboardEvent) => {
 
 .fullscreen-container {
   width: 100vw;
-  height: calc(100vh - 40px); /* Adjust for menu bar height and footer height */
+  height: calc(100vh - 70px); /* menu-bar 20px + tab-bar 30px + footer 20px */
   overflow: hidden;
   background: linear-gradient(135deg, #18181a 0%, #23232b 100%);
   display: flex;
@@ -310,6 +339,90 @@ const insertTab = (e: KeyboardEvent) => {
   color: #ffffff;
 }
 
+/* Tab bar */
+.tab-bar {
+  display: flex;
+  flex-direction: row;
+  width: 100vw;
+  height: 30px;
+  background-color: #2d2d2d;
+  padding: 0;
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.tab-bar::-webkit-scrollbar {
+  height: 3px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  padding: 0 8px 0 12px;
+  background-color: #3c3c3c;
+  color: #aaa;
+  font-size: small;
+  cursor: pointer;
+  user-select: none;
+  border-right: 1px solid #1e1e1e;
+  white-space: nowrap;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.tab:hover {
+  background-color: #464646;
+  color: #ddd;
+}
+
+.tab.active {
+  background-color: #18181a;
+  color: #f6f6f6;
+  border-top: 2px solid #0078d4;
+}
+
+.tab-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  font-size: 14px;
+  line-height: 1;
+  color: #888;
+  padding: 1px 3px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.tab-close:hover {
+  background-color: #666;
+  color: #fff;
+}
+
+.tab-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 100%;
+  color: #aaa;
+  font-size: 18px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.tab-new:hover {
+  background-color: #464646;
+  color: #fff;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   background: #23232b;
@@ -336,7 +449,6 @@ const insertTab = (e: KeyboardEvent) => {
   user-select: none;
   text-align: center;
   font-size: small;
-  padding: 5px 10px;
   box-sizing: border-box;
   border-right: 1px solid #ccc;
   white-space: nowrap;
@@ -371,12 +483,10 @@ const insertTab = (e: KeyboardEvent) => {
   color: #f6f6f6;
   user-select: none;
   font-size: small;
-  padding: 5px 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0 0 0 10px;
   margin: 0;
 }
-
 </style>
