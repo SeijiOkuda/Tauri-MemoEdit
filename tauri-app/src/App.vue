@@ -38,6 +38,27 @@ function isUnsaved(tab: Tab) {
   return tab.text !== tab.textSaved;
 }
 
+async function confirmIfUnsaved(action: 'exit' | 'reopen' | 'close', tab?: Tab): Promise<boolean> {
+  const hasUnsaved = action === 'exit'
+    ? tabs.value.some(isUnsaved)
+    : isUnsaved(tab ?? activeTab.value);
+  if (!hasUnsaved) return true;
+  const message = action === 'exit'
+    ? "変更が保存されていません。終了しますか？"
+    : action === 'reopen'
+    ? "変更が保存されていません。保存せずに再度開き直しますか？"
+    : "変更が保存されていません。タブを閉じますか？";
+  return await ask(message, {
+    title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
+  });
+}
+
+async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "utf-8") {
+  const content = await readTextFile(filePath, { encoding });
+  tab.text = content;
+  tab.textSaved = content;
+}
+
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
     await openFileInTab(event.payload);
@@ -76,9 +97,7 @@ async function openFileInTab(filePath: string) {
   tab.path = filePath;
   tab.charCode = "utf-8";
   try {
-    const content = await readTextFile(filePath, { encoding: "utf-8" });
-    tab.text = content;
-    tab.textSaved = content;
+    await loadFileIntoTab(tab, filePath);
     activeTabId.value = tab.id;
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
@@ -137,35 +156,19 @@ async function openFileDialog() {
   }
 }
 
-async function reOpenFile(encoding: string) {
-  const tab = activeTab.value;
+async function reOpenFile(tab: Tab, encoding: string) {
   if (!tab.path) return;
-
-  if (isUnsaved(tab)) {
-    const ok = await ask("変更が保存されていません。保存せずに再度開き直しますか？", {
-      title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
-    });
-    if (!ok) return;
-  }
-
+  if (!await confirmIfUnsaved('reopen', tab)) return;
   tab.charCode = encoding;
   try {
-    const content = await readTextFile(tab.path, { encoding });
-    tab.text = content;
-    tab.textSaved = content;
+    await loadFileIntoTab(tab, tab.path, encoding);
   } catch (err) {
     console.error("❌ ファイル再読み込み失敗:", err);
   }
 }
 
 async function exitApp() {
-  const hasUnsaved = tabs.value.some(isUnsaved);
-  if (hasUnsaved) {
-    const ok = await ask("変更が保存されていません。終了しますか？", {
-      title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
-    });
-    if (!ok) return;
-  }
+  if (!await confirmIfUnsaved('exit')) return;
   await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
@@ -180,12 +183,7 @@ async function closeTab(tabId: string) {
   const tab = tabs.value.find(t => t.id === tabId);
   if (!tab) return;
 
-  if (isUnsaved(tab)) {
-    const ok = await ask("変更が保存されていません。タブを閉じますか？", {
-      title: "確認", kind: 'warning', okLabel: "はい", cancelLabel: "いいえ"
-    });
-    if (!ok) return;
-  }
+  if (!await confirmIfUnsaved('close', tab)) return;
 
   const idx = tabs.value.findIndex(t => t.id === tabId);
   tabs.value.splice(idx, 1);
@@ -260,8 +258,8 @@ const insertTab = (e: KeyboardEvent) => {
     <div class="char-code" @click="onEncodingClick" ref="menuEncodingRef">
       {{ activeTab.charCode }}
       <div v-if="isMenuEncoding" class="dropdown-encoding">
-        <div class="dropdown-item-encoding" @click="reOpenFile('utf-8')">utf-8</div>
-        <div class="dropdown-item-encoding" @click="reOpenFile('shift-jis')">shift-jis</div>
+        <div class="dropdown-item-encoding" @click="reOpenFile(activeTab, 'utf-8')">utf-8</div>
+        <div class="dropdown-item-encoding" @click="reOpenFile(activeTab, 'shift-jis')">shift-jis</div>
       </div>
     </div>
     <div class="path">{{ activeTab.path }}</div>
