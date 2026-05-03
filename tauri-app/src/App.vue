@@ -593,6 +593,12 @@ watch(
   }
 );
 
+// タブ構造（パス・アクティブタブ）が変わるたびにセッションを保存
+watch(
+  () => tabs.value.map(t => `${t.path}|${t.charCode}|${t.driveFileId}`).join(',') + '::' + activeTabId.value,
+  saveTabSession
+);
+
 const insertTab = (e: KeyboardEvent) => {
   if (textarea.value) {
     const start = textarea.value.selectionStart;
