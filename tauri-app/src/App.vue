@@ -181,43 +181,27 @@ async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "u
 let unlistenAuth: UnlistenFn | null = null;
 let unlistenAuthExpired: UnlistenFn | null = null;
 
-onMounted(async () => {
-  await listen('open-file', async (event: { payload: string }) => {
-    await openFileInTab(event.payload);
-  });
-
-  await listen("app-close-requested", async () => {
-    exitApp();
-  });
-
-  // 保存済みの認証状態を復元
-  const user = await invoke<AuthUser | null>('get_auth_user');
-  if (user) authUser.value = user;
-
+async function restoreTabSession(token: string | null, clearExisting = false) {
   // セッションデータを読み込み（ログイン時はDriveを優先、なければlocalStorage）
   let savedSession: TabSession | null = null;
-  let sessionToken: string | null = null;
-  if (user) {
+  if (token) {
     try {
-      sessionToken = await invoke<string | null>('get_access_token');
-      if (sessionToken) {
-        let driveSessionFileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
-        if (!driveSessionFileId) {
-          const folderId = await getOrCreateAppFolder(sessionToken);
-          const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
-            query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
-            accessToken: sessionToken,
-          });
-          driveSessionFileId = files[0]?.id ?? null;
-          if (driveSessionFileId) localStorage.setItem(DRIVE_SESSION_FILE_KEY, driveSessionFileId);
-        }
-        if (driveSessionFileId) {
-          const content = await invoke<string>('drive_get_file_content', {
-            fileId: driveSessionFileId,
-            accessToken: sessionToken,
-          });
-          savedSession = JSON.parse(content);
-        }
+      let driveSessionFileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
+      if (!driveSessionFileId) {
+        const folderId = await getOrCreateAppFolder(token);
+        const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+          query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
+          accessToken: token,
+        });
+        driveSessionFileId = files[0]?.id ?? null;
+        if (driveSessionFileId) localStorage.setItem(DRIVE_SESSION_FILE_KEY, driveSessionFileId);
+      }
+      if (driveSessionFileId) {
+        const content = await invoke<string>('drive_get_file_content', {
+          fileId: driveSessionFileId,
+          accessToken: token,
+        });
+        savedSession = JSON.parse(content);
       }
     } catch {}
   }
@@ -228,11 +212,16 @@ onMounted(async () => {
     }
   }
 
+  // ログイン後復元の場合、既存の空タブをリセット
+  if (clearExisting && savedSession) {
+    tabs.value = [createTab()];
+    activeTabId.value = tabs.value[0].id;
+  }
+
   // タブをセッション順に復元（旧形式 localTabs にも対応）
   const sessionTabs: SavedTabEntry[] = savedSession?.tabs
     ?? (savedSession?.localTabs?.map(t => ({ path: t.path, charCode: t.charCode })) ?? []);
   if (sessionTabs.length) {
-    const token = sessionToken ?? (user ? await invoke<string | null>('get_access_token') : null);
     for (const entry of sessionTabs) {
       if (entry.path) {
         // ローカルパスで開く（失敗時はDriveにフォールバック）
@@ -242,7 +231,7 @@ onMounted(async () => {
             const tab = tabs.value.find(t => t.path === entry.path);
             if (tab) tab.charCode = entry.charCode;
           }
-        } else if (entry.driveFileId && user && token) {
+        } else if (entry.driveFileId && token) {
           // ローカルファイルが存在しない（別端末等）→ Driveから開く
           try {
             const folderId = await getOrCreateAppFolder(token);
@@ -262,7 +251,7 @@ onMounted(async () => {
             activeTabId.value = tab.id;
           } catch {}
         }
-      } else if (entry.driveFileId && user && token) {
+      } else if (entry.driveFileId && token) {
         // クラウド専用タブ
         try {
           const folderId = await getOrCreateAppFolder(token);
@@ -298,10 +287,30 @@ onMounted(async () => {
     }
     saveTabSession();
   }
+}
+
+onMounted(async () => {
+  await listen('open-file', async (event: { payload: string }) => {
+    await openFileInTab(event.payload);
+  });
+
+  await listen("app-close-requested", async () => {
+    exitApp();
+  });
+
+  // 保存済みの認証状態を復元
+  const user = await invoke<AuthUser | null>('get_auth_user');
+  if (user) authUser.value = user;
+
+  // セッション復元
+  const sessionToken = user ? await invoke<string | null>('get_access_token') : null;
+  await restoreTabSession(sessionToken);
 
   // 認証イベントを購読
-  unlistenAuth = await listen<AuthUser>('auth-complete', (event) => {
+  unlistenAuth = await listen<AuthUser>('auth-complete', async (event) => {
     authUser.value = event.payload;
+    const token = await invoke<string | null>('get_access_token').catch(() => null);
+    await restoreTabSession(token, true);
   });
   unlistenAuthExpired = await listen('auth-expired', () => {
     authUser.value = null;
