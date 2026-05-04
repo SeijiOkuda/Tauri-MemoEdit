@@ -63,14 +63,18 @@ const diffResult = computed(() => {
 // セッション永続化
 const SESSION_KEY = 'memo-edit-tab-session';
 interface SavedTab { path: string; charCode: string; }
-interface TabSession { localTabs: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
+interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; }
+interface TabSession { tabs?: SavedTabEntry[]; localTabs?: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
 function saveTabSession() {
-  const localTabs: SavedTab[] = tabs.value
-    .filter(t => t.path !== null)
-    .map(t => ({ path: t.path!, charCode: t.charCode }));
+  const savedTabs: SavedTabEntry[] = tabs.value
+    .filter(t => t.path !== null || (!t.path && !!t.driveFileId && t.cloudSync))
+    .map(t => t.path
+      ? { path: t.path!, charCode: t.charCode }
+      : { driveFileId: t.driveFileId! }
+    );
   const active = activeTab.value;
   const session: TabSession = {
-    localTabs,
+    tabs: savedTabs,
     activeTabPath: active?.path ?? null,
     activeTabDriveId: (!active?.path && active?.driveFileId) ? active.driveFileId : null,
   };
@@ -138,46 +142,41 @@ onMounted(async () => {
     try { savedSession = JSON.parse(sessionStr); } catch {}
   }
 
-  // クラウド専用タブをセッション復元
-  if (user) {
-    try {
-      const token = await invoke<string | null>('get_access_token');
-      if (token) {
-        const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
-        for (const entry of mappings.cloud_only) {
-          try {
-            const content = await invoke<string>('drive_get_file_content', {
-              fileId: entry.drive_file_id,
-              accessToken: token,
-            });
-            const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
-            const tab = blankTab ?? createTab();
-            if (!blankTab) tabs.value.push(tab);
-            tab.text = content;
-            tab.textSaved = content;
-            tab.driveFileId = entry.drive_file_id;
-            tab.cloudSync = true;
-            tab.cloudStatus = 'synced';
-          } catch {
-            // Driveから削除されていた場合はマッピングも削除
-            await invoke('mapping_remove_cloud_only', { driveFileId: entry.drive_file_id });
+  // タブをセッション順に復元（旧形式 localTabs にも対応）
+  const sessionTabs: SavedTabEntry[] = savedSession?.tabs
+    ?? (savedSession?.localTabs?.map(t => ({ path: t.path, charCode: t.charCode })) ?? []);
+  if (sessionTabs.length) {
+    const needsToken = user && sessionTabs.some(t => !!t.driveFileId);
+    const token = needsToken ? await invoke<string | null>('get_access_token') : null;
+    for (const entry of sessionTabs) {
+      if (entry.path) {
+        // ローカルファイルタブ
+        try {
+          await openFileInTab(entry.path);
+          if (entry.charCode && entry.charCode !== 'utf-8') {
+            const tab = tabs.value.find(t => t.path === entry.path);
+            if (tab) tab.charCode = entry.charCode;
           }
+        } catch {}
+      } else if (entry.driveFileId && user && token) {
+        // クラウド専用タブ
+        try {
+          const content = await invoke<string>('drive_get_file_content', {
+            fileId: entry.driveFileId,
+            accessToken: token,
+          });
+          const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+          const tab = blankTab ?? createTab();
+          if (!blankTab) tabs.value.push(tab);
+          tab.text = content;
+          tab.textSaved = content;
+          tab.driveFileId = entry.driveFileId;
+          tab.cloudSync = true;
+          tab.cloudStatus = 'synced';
+          activeTabId.value = tab.id;
+        } catch {
+          await invoke('mapping_remove_cloud_only', { driveFileId: entry.driveFileId });
         }
-      }
-    } catch (err) {
-      console.error('クラウド専用タブ復元失敗:', err);
-    }
-  }
-
-  // ローカルタブをセッション復元
-  if (savedSession?.localTabs?.length) {
-    for (const st of savedSession.localTabs) {
-      try {
-        await openFileInTab(st.path);
-        const tab = tabs.value.find(t => t.path === st.path);
-        if (tab && st.charCode !== 'utf-8') tab.charCode = st.charCode;
-      } catch {
-        // ファイルが見つからない場合はスキップ
       }
     }
   }
@@ -426,6 +425,14 @@ async function openFileInTab(filePath: string) {
   const isBlank = !cur.path && cur.text === "" && !isUnsaved(cur);
   const tab = isBlank ? cur : createTab();
   if (!isBlank) tabs.value.push(tab);
+
+  // 空タブをローカルファイルタブに置き換える際、cloud_onlyマッピングを削除する（Uの操作）
+  if (isBlank && tab.driveFileId) {
+    try { await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId }); } catch {}
+    tab.driveFileId = null;
+    tab.cloudSync = false;
+    tab.cloudStatus = 'none';
+  }
 
   tab.path = filePath;
   tab.charCode = "utf-8";
