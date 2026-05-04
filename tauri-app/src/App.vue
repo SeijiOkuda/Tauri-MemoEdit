@@ -62,6 +62,9 @@ const diffResult = computed(() => {
 
 // セッション永続化
 const SESSION_KEY = 'memo-edit-tab-session';
+const DRIVE_SESSION_FILENAME = '__memo_edit_session__';
+const DRIVE_SESSION_FILE_KEY = 'memo-edit-drive-session-file-id';
+const APP_FOLDER_KEY = 'memo-edit-drive-folder-id';
 interface SavedTab { path: string; charCode: string; }
 interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; }
 interface TabSession { tabs?: SavedTabEntry[]; localTabs?: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
@@ -69,7 +72,7 @@ function saveTabSession() {
   const savedTabs: SavedTabEntry[] = tabs.value
     .filter(t => t.path !== null || (!t.path && !!t.driveFileId && t.cloudSync))
     .map(t => t.path
-      ? { path: t.path!, charCode: t.charCode }
+      ? { path: t.path!, charCode: t.charCode, ...(t.driveFileId ? { driveFileId: t.driveFileId } : {}) }
       : { driveFileId: t.driveFileId! }
     );
   const active = activeTab.value;
@@ -79,6 +82,64 @@ function saveTabSession() {
     activeTabDriveId: (!active?.path && active?.driveFileId) ? active.driveFileId : null,
   };
   localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+async function getOrCreateAppFolder(token: string): Promise<string> {
+  const cached = localStorage.getItem(APP_FOLDER_KEY);
+  if (cached) return cached;
+
+  // 既存フォルダを検索（別端末からの初回アクセス等）
+  const folders = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+    query: `mimeType = 'application/vnd.google-apps.folder' and name contains 'Tauri-Memo_' and trashed = false`,
+    accessToken: token,
+  });
+  if (folders.length > 0) {
+    localStorage.setItem(APP_FOLDER_KEY, folders[0].id);
+    return folders[0].id;
+  }
+
+  // 新規作成
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const folder = await invoke<{ id: string }>('drive_create_folder', {
+    name: `Tauri-Memo_${ts}`,
+    accessToken: token,
+  });
+  localStorage.setItem(APP_FOLDER_KEY, folder.id);
+  return folder.id;
+}
+
+async function saveDriveSession(token: string) {
+  const sessionStr = localStorage.getItem(SESSION_KEY);
+  if (!sessionStr) return;
+  try {
+    const folderId = await getOrCreateAppFolder(token);
+    let fileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
+    if (fileId) {
+      await invoke('drive_update_file', { fileId, content: sessionStr, accessToken: token });
+    } else {
+      const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+        query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
+        accessToken: token,
+      });
+      fileId = files[0]?.id ?? null;
+      if (fileId) {
+        await invoke('drive_update_file', { fileId, content: sessionStr, accessToken: token });
+      } else {
+        const created = await invoke<{ id: string }>('drive_create_file', {
+          name: DRIVE_SESSION_FILENAME,
+          content: sessionStr,
+          accessToken: token,
+          parentId: folderId,
+        });
+        fileId = created.id;
+      }
+      localStorage.setItem(DRIVE_SESSION_FILE_KEY, fileId!);
+    }
+  } catch (err) {
+    console.error('Drive session save failed:', err);
+  }
 }
 
 // セットアップウィザード
@@ -135,32 +196,79 @@ onMounted(async () => {
   const user = await invoke<AuthUser | null>('get_auth_user');
   if (user) authUser.value = user;
 
-  // セッションデータを読み込み
-  const sessionStr = localStorage.getItem(SESSION_KEY);
+  // セッションデータを読み込み（ログイン時はDriveを優先、なければlocalStorage）
   let savedSession: TabSession | null = null;
-  if (sessionStr) {
-    try { savedSession = JSON.parse(sessionStr); } catch {}
+  let sessionToken: string | null = null;
+  if (user) {
+    try {
+      sessionToken = await invoke<string | null>('get_access_token');
+      if (sessionToken) {
+        let driveSessionFileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
+        if (!driveSessionFileId) {
+          const folderId = await getOrCreateAppFolder(sessionToken);
+          const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+            query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
+            accessToken: sessionToken,
+          });
+          driveSessionFileId = files[0]?.id ?? null;
+          if (driveSessionFileId) localStorage.setItem(DRIVE_SESSION_FILE_KEY, driveSessionFileId);
+        }
+        if (driveSessionFileId) {
+          const content = await invoke<string>('drive_get_file_content', {
+            fileId: driveSessionFileId,
+            accessToken: sessionToken,
+          });
+          savedSession = JSON.parse(content);
+        }
+      }
+    } catch {}
+  }
+  if (!savedSession) {
+    const sessionStr = localStorage.getItem(SESSION_KEY);
+    if (sessionStr) {
+      try { savedSession = JSON.parse(sessionStr); } catch {}
+    }
   }
 
   // タブをセッション順に復元（旧形式 localTabs にも対応）
   const sessionTabs: SavedTabEntry[] = savedSession?.tabs
     ?? (savedSession?.localTabs?.map(t => ({ path: t.path, charCode: t.charCode })) ?? []);
   if (sessionTabs.length) {
-    const needsToken = user && sessionTabs.some(t => !!t.driveFileId);
-    const token = needsToken ? await invoke<string | null>('get_access_token') : null;
+    const token = sessionToken ?? (user ? await invoke<string | null>('get_access_token') : null);
     for (const entry of sessionTabs) {
       if (entry.path) {
-        // ローカルファイルタブ
-        try {
-          await openFileInTab(entry.path);
+        // ローカルパスで開く（失敗時はDriveにフォールバック）
+        const opened = await openFileInTab(entry.path);
+        if (opened) {
           if (entry.charCode && entry.charCode !== 'utf-8') {
             const tab = tabs.value.find(t => t.path === entry.path);
             if (tab) tab.charCode = entry.charCode;
           }
-        } catch {}
+        } else if (entry.driveFileId && user && token) {
+          // ローカルファイルが存在しない（別端末等）→ Driveから開く
+          try {
+            const folderId = await getOrCreateAppFolder(token);
+            await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
+            const content = await invoke<string>('drive_get_file_content', {
+              fileId: entry.driveFileId,
+              accessToken: token,
+            });
+            const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+            const tab = blankTab ?? createTab();
+            if (!blankTab) tabs.value.push(tab);
+            tab.text = content;
+            tab.textSaved = content;
+            tab.driveFileId = entry.driveFileId;
+            tab.cloudSync = true;
+            tab.cloudStatus = 'synced';
+            activeTabId.value = tab.id;
+          } catch {}
+        }
       } else if (entry.driveFileId && user && token) {
         // クラウド専用タブ
         try {
+          const folderId = await getOrCreateAppFolder(token);
+          await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
           const content = await invoke<string>('drive_get_file_content', {
             fileId: entry.driveFileId,
             accessToken: token,
@@ -289,10 +397,12 @@ async function initCloudForTab(tab: Tab) {
     if (!token) return;
     tab.cloudStatus = 'syncing';
     const name = generateTimestampFilename();
+    const folderId = await getOrCreateAppFolder(token);
     const file = await invoke<{ id: string }>('drive_create_file', {
       name,
       content: tab.text,
       accessToken: token,
+      parentId: folderId,
     });
     tab.driveFileId = file.id;
     tab.cloudSync = true;
@@ -447,6 +557,10 @@ async function openFileInTab(filePath: string) {
       try {
         const token = await invoke<string | null>('get_access_token');
         if (token) {
+          // フォルダ外のファイルを移動（既存マッピングの移行）
+          const folderId = await getOrCreateAppFolder(token);
+          await invoke('drive_move_to_folder', { fileId: driveId, folderId, accessToken: token }).catch(() => {});
+
           const driveContent = await invoke<string>('drive_get_file_content', {
             fileId: driveId,
             accessToken: token,
@@ -468,9 +582,16 @@ async function openFileInTab(filePath: string) {
       tab.cloudStatus = 'synced';
     }
     saveTabSession();
+    return true;
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
-    if (!isBlank) tabs.value = tabs.value.filter(t => t.id !== tab.id);
+    if (!isBlank) {
+      tabs.value = tabs.value.filter(t => t.id !== tab.id);
+    } else {
+      tab.path = null;
+      tab.charCode = 'utf-8';
+    }
+    return false;
   }
 }
 
@@ -545,6 +666,10 @@ async function reOpenFile(tab: Tab, encoding: string) {
 async function exitApp() {
   if (!await confirmIfUnsaved('exit')) return;
   saveTabSession();
+  if (authUser.value) {
+    const token = await invoke<string | null>('get_access_token');
+    if (token) await saveDriveSession(token);
+  }
   await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
