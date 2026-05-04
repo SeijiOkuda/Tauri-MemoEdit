@@ -443,8 +443,6 @@ function showTabContextMenu(tab: Tab, event: MouseEvent) {
 
 async function disableCloudSync(tab: Tab) {
   tabContextMenu.value = null;
-  const timer = cloudSyncTimers.get(tab.id);
-  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tab.id); }
   if (tab.driveFileId) {
     try {
       const token = await invoke<string | null>('get_access_token');
