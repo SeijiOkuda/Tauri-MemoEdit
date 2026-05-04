@@ -51,8 +51,6 @@ const menuAuthRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const authUser = ref<AuthUser | null>(null);
 
-// クラウド同期
-const cloudSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const tabContextMenu = ref<{ tab: Tab; x: number; y: number } | null>(null);
 const conflictDialog = ref<ConflictDialogData | null>(null);
 const diffResult = computed(() => {
@@ -421,17 +419,6 @@ async function initCloudForTab(tab: Tab) {
   }
 }
 
-function scheduleCloudSync(tab: Tab) {
-  const existing = cloudSyncTimers.get(tab.id);
-  if (existing) clearTimeout(existing);
-  tab.cloudStatus = 'syncing';
-  const timer = setTimeout(async () => {
-    cloudSyncTimers.delete(tab.id);
-    await syncTabToCloud(tab);
-  }, 10000);
-  cloudSyncTimers.set(tab.id, timer);
-}
-
 async function syncTabToCloud(tab: Tab) {
   if (!tab.driveFileId || !tab.cloudSync) return;
   try {
@@ -597,6 +584,13 @@ async function openFileInTab(filePath: string) {
 
 async function saveFile() {
   const tab = activeTab.value;
+
+  // クラウド専用タブ（ローカルパスなし）はDriveへ直接保存
+  if (!tab.path && tab.cloudSync && tab.driveFileId) {
+    await syncTabToCloud(tab);
+    return;
+  }
+
   const wasCloudOnly = tab.cloudSync && !tab.path;
   if (!tab.path) {
     const newPath = await save({
@@ -623,6 +617,36 @@ async function saveFile() {
     await writeTextFile(tab.path, tab.text);
     tab.textSaved = tab.text;
     tab.charCode = "utf-8";
+    // ローカル保存と同時にクラウドへも同期
+    if (tab.cloudSync && tab.driveFileId) {
+      await syncTabToCloud(tab);
+    }
+  } catch (err) {
+    console.error("❌ ファイル保存失敗:", err);
+  }
+}
+
+async function downloadCloudTab(tab: Tab) {
+  const newPath = await save({
+    filters: [{ name: 'Text Files', extensions: ['txt'] }],
+    defaultPath: 'memo.txt',
+  });
+  if (!newPath) return;
+
+  const wasCloudOnly = tab.cloudSync && !tab.path;
+  tab.path = newPath;
+  if (wasCloudOnly && tab.driveFileId) {
+    await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
+    await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
+  }
+
+  try {
+    await writeTextFile(tab.path, tab.text);
+    tab.textSaved = tab.text;
+    tab.charCode = "utf-8";
+    if (tab.cloudSync && tab.driveFileId) {
+      await syncTabToCloud(tab);
+    }
   } catch (err) {
     console.error("❌ ファイル保存失敗:", err);
   }
@@ -687,19 +711,12 @@ async function closeTab(tabId: string) {
   const tab = tabs.value.find(t => t.id === tabId);
   if (!tab) return;
 
-  // クラウド専用タブでデバウンス待ちの場合は即座に同期してから閉じる
-  if (tab.cloudSync && !tab.path && cloudSyncTimers.has(tabId)) {
-    const timer = cloudSyncTimers.get(tabId)!;
-    clearTimeout(timer);
-    cloudSyncTimers.delete(tabId);
+  // タブを閉じる前にクラウド同期
+  if (tab.cloudSync && tab.driveFileId) {
     await syncTabToCloud(tab);
   }
 
   if (!await confirmIfUnsaved('close', tab)) return;
-
-  // 残っているタイマーをクリア
-  const timer = cloudSyncTimers.get(tabId);
-  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tabId); }
 
   const idx = tabs.value.findIndex(t => t.id === tabId);
   tabs.value.splice(idx, 1);
@@ -714,16 +731,6 @@ async function closeTab(tabId: string) {
   }
   saveTabSession();
 }
-
-watch(
-  () => activeTab.value?.text,
-  (newText, oldText) => {
-    if (newText === oldText) return;
-    const tab = activeTab.value;
-    if (!tab?.cloudSync || !tab.driveFileId) return;
-    scheduleCloudSync(tab);
-  }
-);
 
 // タブ構造（パス・アクティブタブ）が変わるたびにセッションを保存
 watch(
@@ -855,6 +862,7 @@ const insertTab = (e: KeyboardEvent) => {
   <div v-if="tabContextMenu" class="tab-context-menu" :style="{ left: tabContextMenu.x + 'px', top: tabContextMenu.y + 'px' }">
     <div v-if="tabContextMenu.tab.cloudSync" class="context-item" @click.stop="disableCloudSync(tabContextMenu.tab)">クラウド同期を解除</div>
     <div v-else-if="authUser" class="context-item" @click.stop="enableCloudSync(tabContextMenu.tab)">クラウドに同期する</div>
+    <div v-if="tabContextMenu.tab.cloudSync && !tabContextMenu.tab.path" class="context-item" @click.stop="downloadCloudTab(tabContextMenu.tab); tabContextMenu = null">ダウンロード</div>
     <div class="context-item context-item-danger" @click.stop="closeTab(tabContextMenu.tab.id); tabContextMenu = null">タブを閉じる</div>
   </div>
 
