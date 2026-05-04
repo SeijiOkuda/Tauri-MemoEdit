@@ -4,7 +4,8 @@
       "Bash(cargo build:*)",
       "Bash(npx vue-tsc:*)",
       "Bash(npm run:*)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(awk:*)"
     ]
   }
 }
