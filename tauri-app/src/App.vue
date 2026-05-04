@@ -7,6 +7,15 @@ import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from '@tauri-apps/plugin-opener';
 
+type DiffLineType = 'same' | 'local-only' | 'drive-only';
+interface DiffLine { text: string; type: DiffLineType; }
+interface ConflictDialogData {
+  tab: Tab;
+  localContent: string;
+  driveContent: string;
+  resolve: (choice: 'local' | 'drive') => void;
+}
+
 interface AuthUser {
   name: string;
   email: string;
@@ -15,6 +24,7 @@ interface AuthUser {
 
 interface Tab {
   id: string;
+  name: string;
   text: string;
   textSaved: string;
   path: string | null;
@@ -26,7 +36,7 @@ interface Tab {
 
 let nextId = 1;
 function createTab(): Tab {
-  return { id: String(nextId++), text: "", textSaved: "", path: null, charCode: "utf-8", driveFileId: null, cloudSync: false, cloudStatus: 'none' };
+  return { id: String(nextId++), name: "新しいファイル", text: "", textSaved: "", path: null, charCode: "utf-8", driveFileId: null, cloudSync: false, cloudStatus: 'none' };
 }
 
 const tabs = ref<Tab[]>([createTab()]);
@@ -42,9 +52,98 @@ const menuAuthRef = ref<HTMLElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const authUser = ref<AuthUser | null>(null);
 
-// クラウド同期
-const cloudSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const tabContextMenu = ref<{ tab: Tab; x: number; y: number } | null>(null);
+const conflictDialog = ref<ConflictDialogData | null>(null);
+const diffResult = computed(() => {
+  if (!conflictDialog.value) return { local: [] as DiffLine[], drive: [] as DiffLine[] };
+  return computeDiff(conflictDialog.value.localContent, conflictDialog.value.driveContent);
+});
+
+// セッション永続化
+const SESSION_KEY = 'memo-edit-tab-session';
+const DRIVE_SESSION_FILENAME = '__memo_edit_session__';
+const DRIVE_SESSION_FILE_KEY = 'memo-edit-drive-session-file-id';
+const APP_FOLDER_KEY = 'memo-edit-drive-folder-id';
+interface SavedTab { path: string; charCode: string; }
+interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; name?: string; }
+interface TabSession { tabs?: SavedTabEntry[]; localTabs?: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
+function saveTabSession() {
+  const savedTabs: SavedTabEntry[] = tabs.value
+    .filter(t => t.path !== null || (!t.path && !!t.driveFileId && t.cloudSync))
+    .map(t => t.path
+      ? { path: t.path!, charCode: t.charCode, name: t.name, ...(t.driveFileId ? { driveFileId: t.driveFileId } : {}) }
+      : { driveFileId: t.driveFileId!, name: t.name }
+    );
+  const active = activeTab.value;
+  const session: TabSession = {
+    tabs: savedTabs,
+    activeTabPath: active?.path ?? null,
+    activeTabDriveId: (!active?.path && active?.driveFileId) ? active.driveFileId : null,
+  };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+async function getOrCreateAppFolder(token: string): Promise<string> {
+  const cached = localStorage.getItem(APP_FOLDER_KEY);
+  if (cached) return cached;
+
+  // 既存フォルダを検索（別端末からの初回アクセス等）
+  const folders = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+    query: `mimeType = 'application/vnd.google-apps.folder' and name contains 'Tauri-Memo_' and trashed = false`,
+    accessToken: token,
+  });
+  if (folders.length > 0) {
+    localStorage.setItem(APP_FOLDER_KEY, folders[0].id);
+    return folders[0].id;
+  }
+
+  // 新規作成
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const folder = await invoke<{ id: string }>('drive_create_folder', {
+    name: `Tauri-Memo_${ts}`,
+    accessToken: token,
+  });
+  localStorage.setItem(APP_FOLDER_KEY, folder.id);
+  return folder.id;
+}
+
+async function saveDriveSession(token: string) {
+  try {
+    // DriveセッションはdriveFileIdとnameのみ（pathは端末依存なので除外）
+    const driveTabs = tabs.value
+      .filter(t => !!t.driveFileId && t.cloudSync)
+      .map(t => ({ driveFileId: t.driveFileId!, name: t.name }));
+    const content = JSON.stringify({ tabs: driveTabs });
+
+    const folderId = await getOrCreateAppFolder(token);
+    let fileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
+    if (fileId) {
+      await invoke('drive_update_file', { fileId, content, accessToken: token });
+    } else {
+      const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+        query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
+        accessToken: token,
+      });
+      fileId = files[0]?.id ?? null;
+      if (fileId) {
+        await invoke('drive_update_file', { fileId, content, accessToken: token });
+      } else {
+        const created = await invoke<{ id: string }>('drive_create_file', {
+          name: DRIVE_SESSION_FILENAME,
+          content,
+          accessToken: token,
+          parentId: folderId,
+        });
+        fileId = created.id;
+      }
+      localStorage.setItem(DRIVE_SESSION_FILE_KEY, fileId!);
+    }
+  } catch (err) {
+    console.error('Drive session save failed:', err);
+  }
+}
 
 // セットアップウィザード
 const showSetupWizard = ref(false);
@@ -55,8 +154,13 @@ const setupSaving = ref(false);
 const setupError = ref('');
 
 function tabName(tab: Tab) {
-  if (tab.path) return tab.path.split(/[\\/]/).pop() ?? tab.path;
-  return "新しいファイル";
+  return tab.name;
+}
+
+function cloudIconTitle(tab: Tab) {
+  const status = tab.cloudStatus === 'synced' ? '同期済み' : tab.cloudStatus === 'syncing' ? '同期中...' : '同期エラー';
+  const type = tab.path ? 'ローカル+クラウド' : 'クラウド専用';
+  return `${type} (${status})`;
 }
 
 function isUnsaved(tab: Tab) {
@@ -87,6 +191,135 @@ async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "u
 let unlistenAuth: UnlistenFn | null = null;
 let unlistenAuthExpired: UnlistenFn | null = null;
 
+async function restoreTabSession(token: string | null, clearExisting = false) {
+  // セッションデータを読み込み（ログイン時はDriveを優先、なければlocalStorage）
+  let savedSession: TabSession | null = null;
+  let fromDrive = false;
+  if (token) {
+    try {
+      let driveSessionFileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
+      if (!driveSessionFileId) {
+        const folderId = await getOrCreateAppFolder(token);
+        const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
+          query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
+          accessToken: token,
+        });
+        driveSessionFileId = files[0]?.id ?? null;
+        if (driveSessionFileId) localStorage.setItem(DRIVE_SESSION_FILE_KEY, driveSessionFileId);
+      }
+      if (driveSessionFileId) {
+        const content = await invoke<string>('drive_get_file_content', {
+          fileId: driveSessionFileId,
+          accessToken: token,
+        });
+        savedSession = JSON.parse(content);
+        fromDrive = true;
+      }
+    } catch {}
+  }
+  if (!savedSession) {
+    const sessionStr = localStorage.getItem(SESSION_KEY);
+    if (sessionStr) {
+      try { savedSession = JSON.parse(sessionStr); } catch {}
+    }
+  }
+
+  // Driveセッション復元時: ローカルマッピングを逆引きしてpathを補完
+  if (fromDrive && savedSession?.tabs) {
+    try {
+      const mappings = await invoke<{ local: Record<string, string> }>('mapping_get_all');
+      const driveIdToPath: Record<string, string> = {};
+      for (const [path, driveId] of Object.entries(mappings.local)) {
+        driveIdToPath[driveId] = path;
+      }
+      for (const entry of savedSession.tabs) {
+        if (entry.driveFileId && !entry.path) {
+          const localPath = driveIdToPath[entry.driveFileId];
+          if (localPath) entry.path = localPath;
+        }
+      }
+    } catch {}
+  }
+
+  // ログイン後復元の場合、既存の空タブをリセット
+  if (clearExisting && savedSession) {
+    tabs.value = [createTab()];
+    activeTabId.value = tabs.value[0].id;
+  }
+
+  // タブをセッション順に復元（旧形式 localTabs にも対応）
+  const sessionTabs: SavedTabEntry[] = savedSession?.tabs
+    ?? (savedSession?.localTabs?.map(t => ({ path: t.path, charCode: t.charCode })) ?? []);
+  if (sessionTabs.length) {
+    for (const entry of sessionTabs) {
+      if (entry.path) {
+        // ローカルパスで開く（失敗時はDriveにフォールバック）
+        const opened = await openFileInTab(entry.path);
+        if (opened) {
+          if (entry.charCode && entry.charCode !== 'utf-8') {
+            const tab = tabs.value.find(t => t.path === entry.path);
+            if (tab) tab.charCode = entry.charCode;
+          }
+        } else if (entry.driveFileId && token) {
+          // ローカルファイルが存在しない（別端末等）→ Driveから開く
+          try {
+            const folderId = await getOrCreateAppFolder(token);
+            await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
+            const content = await invoke<string>('drive_get_file_content', {
+              fileId: entry.driveFileId,
+              accessToken: token,
+            });
+            const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+            const tab = blankTab ?? createTab();
+            if (!blankTab) tabs.value.push(tab);
+            tab.name = entry.name ?? "新しいファイル";
+            tab.text = content;
+            tab.textSaved = content;
+            tab.driveFileId = entry.driveFileId;
+            tab.cloudSync = true;
+            tab.cloudStatus = 'synced';
+            activeTabId.value = tab.id;
+          } catch {}
+        }
+      } else if (entry.driveFileId && token) {
+        // クラウド専用タブ
+        try {
+          const folderId = await getOrCreateAppFolder(token);
+          await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
+          const content = await invoke<string>('drive_get_file_content', {
+            fileId: entry.driveFileId,
+            accessToken: token,
+          });
+          const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+          const tab = blankTab ?? createTab();
+          if (!blankTab) tabs.value.push(tab);
+          tab.name = entry.name ?? "新しいファイル";
+          tab.text = content;
+          tab.textSaved = content;
+          tab.driveFileId = entry.driveFileId;
+          tab.cloudSync = true;
+          tab.cloudStatus = 'synced';
+          activeTabId.value = tab.id;
+        } catch {
+          await invoke('mapping_remove_cloud_only', { driveFileId: entry.driveFileId });
+        }
+      }
+    }
+  }
+
+  // アクティブタブを復元
+  if (savedSession) {
+    if (savedSession.activeTabPath) {
+      const restoredActive = tabs.value.find(t => t.path === savedSession!.activeTabPath);
+      if (restoredActive) activeTabId.value = restoredActive.id;
+    } else if (savedSession.activeTabDriveId) {
+      const restoredActive = tabs.value.find(t => t.driveFileId === savedSession!.activeTabDriveId);
+      if (restoredActive) activeTabId.value = restoredActive.id;
+    }
+    saveTabSession();
+  }
+}
+
 onMounted(async () => {
   await listen('open-file', async (event: { payload: string }) => {
     await openFileInTab(event.payload);
@@ -100,9 +333,15 @@ onMounted(async () => {
   const user = await invoke<AuthUser | null>('get_auth_user');
   if (user) authUser.value = user;
 
+  // セッション復元
+  const sessionToken = user ? await invoke<string | null>('get_access_token') : null;
+  await restoreTabSession(sessionToken);
+
   // 認証イベントを購読
-  unlistenAuth = await listen<AuthUser>('auth-complete', (event) => {
+  unlistenAuth = await listen<AuthUser>('auth-complete', async (event) => {
     authUser.value = event.payload;
+    const token = await invoke<string | null>('get_access_token').catch(() => null);
+    await restoreTabSession(token, true);
   });
   unlistenAuthExpired = await listen('auth-expired', () => {
     authUser.value = null;
@@ -134,6 +373,56 @@ function handleClickOutside(e: MouseEvent) {
   tabContextMenu.value = null;
 }
 
+// -----------------------------------------------------------------------
+// LCSベースの行差分計算
+// -----------------------------------------------------------------------
+function computeDiff(localText: string, driveText: string): { local: DiffLine[]; drive: DiffLine[] } {
+  const a = localText.split('\n');
+  const b = driveText.split('\n');
+  const m = a.length;
+  const n = b.length;
+
+  // LCS DPテーブル
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+    }
+  }
+
+  // バックトラック
+  const localLines: DiffLine[] = [];
+  const driveLines: DiffLine[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i-1] === b[j-1]) {
+      localLines.unshift({ text: a[i-1], type: 'same' });
+      driveLines.unshift({ text: b[j-1], type: 'same' });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+      driveLines.unshift({ text: b[j-1], type: 'drive-only' });
+      j--;
+    } else {
+      localLines.unshift({ text: a[i-1], type: 'local-only' });
+      i--;
+    }
+  }
+  return { local: localLines, drive: driveLines };
+}
+
+function showConflictDialog(tab: Tab, localContent: string, driveContent: string): Promise<'local' | 'drive'> {
+  return new Promise((resolve) => {
+    conflictDialog.value = { tab, localContent, driveContent, resolve };
+  });
+}
+
+function resolveConflict(choice: 'local' | 'drive') {
+  if (!conflictDialog.value) return;
+  conflictDialog.value.resolve(choice);
+  conflictDialog.value = null;
+}
+
+// -----------------------------------------------------------------------
 function generateTimestampFilename(): string {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -145,30 +434,29 @@ async function initCloudForTab(tab: Tab) {
     const token = await invoke<string | null>('get_access_token');
     if (!token) return;
     tab.cloudStatus = 'syncing';
+    const name = generateTimestampFilename();
+    const folderId = await getOrCreateAppFolder(token);
     const file = await invoke<{ id: string }>('drive_create_file', {
-      name: generateTimestampFilename(),
+      name,
       content: tab.text,
       accessToken: token,
+      parentId: folderId,
     });
     tab.driveFileId = file.id;
     tab.cloudSync = true;
     tab.textSaved = tab.text;
     tab.cloudStatus = 'synced';
+
+    // マッピングを保存
+    if (tab.path) {
+      await invoke('mapping_set_local', { localPath: tab.path, driveFileId: file.id });
+    } else {
+      await invoke('mapping_add_cloud_only', { driveFileId: file.id, name });
+    }
   } catch (err) {
     tab.cloudStatus = 'error';
     console.error('Drive file creation failed:', err);
   }
-}
-
-function scheduleCloudSync(tab: Tab) {
-  const existing = cloudSyncTimers.get(tab.id);
-  if (existing) clearTimeout(existing);
-  tab.cloudStatus = 'syncing';
-  const timer = setTimeout(async () => {
-    cloudSyncTimers.delete(tab.id);
-    await syncTabToCloud(tab);
-  }, 10000);
-  cloudSyncTimers.set(tab.id, timer);
 }
 
 async function syncTabToCloud(tab: Tab) {
@@ -195,14 +483,18 @@ function showTabContextMenu(tab: Tab, event: MouseEvent) {
 
 async function disableCloudSync(tab: Tab) {
   tabContextMenu.value = null;
-  const timer = cloudSyncTimers.get(tab.id);
-  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tab.id); }
   if (tab.driveFileId) {
     try {
       const token = await invoke<string | null>('get_access_token');
       if (token) await invoke('drive_delete_file', { fileId: tab.driveFileId, accessToken: token });
     } catch (err) {
       console.error('Drive delete failed:', err);
+    }
+    // マッピングを削除
+    if (tab.path) {
+      await invoke('mapping_remove_local', { localPath: tab.path });
+    } else {
+      await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
     }
   }
   tab.driveFileId = null;
@@ -269,19 +561,76 @@ async function openFileInTab(filePath: string) {
   const tab = isBlank ? cur : createTab();
   if (!isBlank) tabs.value.push(tab);
 
+  // 空タブをローカルファイルタブに置き換える際、cloud_onlyマッピングを削除する（Uの操作）
+  if (isBlank && tab.driveFileId) {
+    try { await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId }); } catch {}
+    tab.driveFileId = null;
+    tab.cloudSync = false;
+    tab.cloudStatus = 'none';
+  }
+
   tab.path = filePath;
+  tab.name = filePath.split(/[\\/]/).pop() ?? filePath;
   tab.charCode = "utf-8";
   try {
     await loadFileIntoTab(tab, filePath);
     activeTabId.value = tab.id;
+
+    // マッピングからDriveの紐づけを復元し、競合チェック
+    const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
+    const driveId = mappings.local[filePath];
+    if (driveId) {
+      try {
+        const token = await invoke<string | null>('get_access_token');
+        if (token) {
+          // フォルダ外のファイルを移動（既存マッピングの移行）
+          const folderId = await getOrCreateAppFolder(token);
+          await invoke('drive_move_to_folder', { fileId: driveId, folderId, accessToken: token }).catch(() => {});
+
+          const driveContent = await invoke<string>('drive_get_file_content', {
+            fileId: driveId,
+            accessToken: token,
+          });
+          if (driveContent !== tab.text) {
+            // 差分あり → 競合ダイアログ
+            const choice = await showConflictDialog(tab, tab.text, driveContent);
+            if (choice === 'drive') {
+              tab.text = driveContent;
+              tab.textSaved = driveContent;
+            }
+          }
+        }
+      } catch (err) {
+        console.error('競合チェック失敗:', err);
+      }
+      tab.driveFileId = driveId;
+      tab.cloudSync = true;
+      tab.cloudStatus = 'synced';
+    }
+    saveTabSession();
+    return true;
   } catch (err) {
     console.error("❌ ファイル読み込み失敗:", err);
-    if (!isBlank) tabs.value = tabs.value.filter(t => t.id !== tab.id);
+    if (!isBlank) {
+      tabs.value = tabs.value.filter(t => t.id !== tab.id);
+    } else {
+      tab.path = null;
+      tab.charCode = 'utf-8';
+    }
+    return false;
   }
 }
 
 async function saveFile() {
   const tab = activeTab.value;
+
+  // クラウド専用タブ（ローカルパスなし）はDriveへ直接保存
+  if (!tab.path && tab.cloudSync && tab.driveFileId) {
+    await syncTabToCloud(tab);
+    return;
+  }
+
+  const wasCloudOnly = tab.cloudSync && !tab.path;
   if (!tab.path) {
     const newPath = await save({
       filters: [{ name: 'Text Files', extensions: ['txt'] }],
@@ -289,6 +638,12 @@ async function saveFile() {
     });
     if (!newPath) return;
     tab.path = newPath;
+    tab.name = newPath.split(/[\\/]/).pop() ?? newPath;
+    // クラウド専用→ローカル+クラウドに昇格: マッピングを更新
+    if (wasCloudOnly && tab.driveFileId) {
+      await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
+      await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
+    }
   }
 
   if (tab.charCode !== "utf-8") {
@@ -302,6 +657,37 @@ async function saveFile() {
     await writeTextFile(tab.path, tab.text);
     tab.textSaved = tab.text;
     tab.charCode = "utf-8";
+    // ローカル保存と同時にクラウドへも同期
+    if (tab.cloudSync && tab.driveFileId) {
+      await syncTabToCloud(tab);
+    }
+  } catch (err) {
+    console.error("❌ ファイル保存失敗:", err);
+  }
+}
+
+async function downloadCloudTab(tab: Tab) {
+  const newPath = await save({
+    filters: [{ name: 'Text Files', extensions: ['txt'] }],
+    defaultPath: 'memo.txt',
+  });
+  if (!newPath) return;
+
+  const wasCloudOnly = tab.cloudSync && !tab.path;
+  tab.path = newPath;
+  tab.name = newPath.split(/[\\/]/).pop() ?? newPath;
+  if (wasCloudOnly && tab.driveFileId) {
+    await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
+    await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
+  }
+
+  try {
+    await writeTextFile(tab.path, tab.text);
+    tab.textSaved = tab.text;
+    tab.charCode = "utf-8";
+    if (tab.cloudSync && tab.driveFileId) {
+      await syncTabToCloud(tab);
+    }
   } catch (err) {
     console.error("❌ ファイル保存失敗:", err);
   }
@@ -344,6 +730,11 @@ async function reOpenFile(tab: Tab, encoding: string) {
 
 async function exitApp() {
   if (!await confirmIfUnsaved('exit')) return;
+  saveTabSession();
+  if (authUser.value) {
+    const token = await invoke<string | null>('get_access_token');
+    if (token) await saveDriveSession(token);
+  }
   await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
@@ -361,19 +752,12 @@ async function closeTab(tabId: string) {
   const tab = tabs.value.find(t => t.id === tabId);
   if (!tab) return;
 
-  // クラウド専用タブでデバウンス待ちの場合は即座に同期してから閉じる
-  if (tab.cloudSync && !tab.path && cloudSyncTimers.has(tabId)) {
-    const timer = cloudSyncTimers.get(tabId)!;
-    clearTimeout(timer);
-    cloudSyncTimers.delete(tabId);
+  // タブを閉じる前にクラウド同期
+  if (tab.cloudSync && tab.driveFileId) {
     await syncTabToCloud(tab);
   }
 
   if (!await confirmIfUnsaved('close', tab)) return;
-
-  // 残っているタイマーをクリア
-  const timer = cloudSyncTimers.get(tabId);
-  if (timer) { clearTimeout(timer); cloudSyncTimers.delete(tabId); }
 
   const idx = tabs.value.findIndex(t => t.id === tabId);
   tabs.value.splice(idx, 1);
@@ -386,16 +770,13 @@ async function closeTab(tabId: string) {
   } else if (activeTabId.value === tabId) {
     activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)].id;
   }
+  saveTabSession();
 }
 
+// タブ構造（パス・アクティブタブ）が変わるたびにセッションを保存
 watch(
-  () => activeTab.value?.text,
-  (newText, oldText) => {
-    if (newText === oldText) return;
-    const tab = activeTab.value;
-    if (!tab?.cloudSync || !tab.driveFileId) return;
-    scheduleCloudSync(tab);
-  }
+  () => tabs.value.map(t => `${t.path}|${t.charCode}|${t.driveFileId}`).join(',') + '::' + activeTabId.value,
+  saveTabSession
 );
 
 const insertTab = (e: KeyboardEvent) => {
@@ -459,9 +840,12 @@ const insertTab = (e: KeyboardEvent) => {
       @click="activeTabId = tab.id"
       @contextmenu.prevent="showTabContextMenu(tab, $event)"
     >
-      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="'cloud-' + tab.cloudStatus" :title="tab.cloudStatus === 'synced' ? 'クラウド同期済み' : tab.cloudStatus === 'syncing' ? '同期中...' : '同期エラー'">
+      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="['cloud-' + tab.cloudStatus, tab.path ? 'cloud-local' : 'cloud-only']" :title="cloudIconTitle(tab)">
         <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
           <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+        </svg>
+        <svg v-if="tab.path" xmlns="http://www.w3.org/2000/svg" width="9" height="9" viewBox="0 0 24 24" fill="currentColor" style="margin-left:1px">
+          <path d="M19 2H5C3.9 2 3 2.9 3 4v16c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm5-8H7V5h10v3z"/>
         </svg>
       </span>
       <span class="tab-name">{{ tabName(tab) }}{{ isUnsaved(tab) ? ' ●' : '' }}</span>
@@ -480,10 +864,49 @@ const insertTab = (e: KeyboardEvent) => {
       autofocus
     ></textarea>
   </main>
+  <!-- 競合ダイアログ -->
+  <div v-if="conflictDialog" class="conflict-overlay">
+    <div class="conflict-modal">
+      <div class="conflict-header">
+        <h2 class="conflict-title">競合が検出されました</h2>
+        <p class="conflict-subtitle">{{ conflictDialog.tab.path ?? 'クラウドファイル' }} のローカル版とDrive版の内容が異なります。使用するバージョンを選んでください。</p>
+        <div class="conflict-legend">
+          <span class="legend-local">■ ローカルのみの行</span>
+          <span class="legend-drive">■ Driveのみの行</span>
+        </div>
+      </div>
+      <div class="conflict-panels">
+        <div class="conflict-panel">
+          <div class="conflict-panel-header">ローカル版 <span class="conflict-line-count">{{ diffResult.local.length }}行</span></div>
+          <div class="diff-view">
+            <div v-for="(line, idx) in diffResult.local" :key="idx" :class="['diff-line', 'diff-' + line.type]">
+              <span class="diff-ln">{{ idx + 1 }}</span>
+              <span class="diff-text">{{ line.text }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="conflict-panel">
+          <div class="conflict-panel-header">Drive版 <span class="conflict-line-count">{{ diffResult.drive.length }}行</span></div>
+          <div class="diff-view">
+            <div v-for="(line, idx) in diffResult.drive" :key="idx" :class="['diff-line', 'diff-' + line.type]">
+              <span class="diff-ln">{{ idx + 1 }}</span>
+              <span class="diff-text">{{ line.text }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="conflict-actions">
+        <button class="conflict-btn conflict-btn-local" @click="resolveConflict('local')">ローカル版を使用</button>
+        <button class="conflict-btn conflict-btn-drive" @click="resolveConflict('drive')">Drive版を使用</button>
+      </div>
+    </div>
+  </div>
+
   <!-- タブ右クリックメニュー -->
   <div v-if="tabContextMenu" class="tab-context-menu" :style="{ left: tabContextMenu.x + 'px', top: tabContextMenu.y + 'px' }">
     <div v-if="tabContextMenu.tab.cloudSync" class="context-item" @click.stop="disableCloudSync(tabContextMenu.tab)">クラウド同期を解除</div>
     <div v-else-if="authUser" class="context-item" @click.stop="enableCloudSync(tabContextMenu.tab)">クラウドに同期する</div>
+    <div v-if="tabContextMenu.tab.cloudSync && !tabContextMenu.tab.path" class="context-item" @click.stop="downloadCloudTab(tabContextMenu.tab); tabContextMenu = null">ダウンロード</div>
     <div class="context-item context-item-danger" @click.stop="closeTab(tabContextMenu.tab.id); tabContextMenu = null">タブを閉じる</div>
   </div>
 
@@ -870,11 +1293,177 @@ const insertTab = (e: KeyboardEvent) => {
   margin: 0;
 }
 
+/* Conflict dialog */
+.conflict-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.conflict-modal {
+  background: #1e1e2e;
+  border: 1px solid #3c3c5c;
+  border-radius: 8px;
+  width: 90vw;
+  max-width: 1000px;
+  height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.conflict-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.conflict-title {
+  color: #f6f6f6;
+  font-size: 1rem;
+  margin: 0 0 4px;
+}
+
+.conflict-subtitle {
+  color: #aaa;
+  font-size: 0.82rem;
+  margin: 0 0 8px;
+}
+
+.conflict-legend {
+  display: flex;
+  gap: 16px;
+  font-size: 0.78rem;
+}
+
+.legend-local { color: #e07070; }
+.legend-drive { color: #70c070; }
+
+.conflict-panels {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  gap: 1px;
+  background: #333;
+}
+
+.conflict-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #1e1e2e;
+}
+
+.conflict-panel-header {
+  padding: 6px 12px;
+  background: #252536;
+  color: #ccc;
+  font-size: 0.82rem;
+  font-weight: bold;
+  flex-shrink: 0;
+  border-bottom: 1px solid #333;
+}
+
+.conflict-line-count {
+  color: #888;
+  font-weight: normal;
+  margin-left: 6px;
+}
+
+.diff-view {
+  flex: 1;
+  overflow-y: auto;
+  font-family: 'Fira Mono', 'Consolas', monospace;
+  font-size: 0.8rem;
+}
+
+.diff-line {
+  display: flex;
+  align-items: baseline;
+  min-height: 1.4em;
+  padding: 1px 0;
+}
+
+.diff-line.diff-local-only {
+  background: rgba(200, 60, 60, 0.25);
+}
+
+.diff-line.diff-drive-only {
+  background: rgba(60, 180, 60, 0.2);
+}
+
+.diff-ln {
+  width: 40px;
+  min-width: 40px;
+  text-align: right;
+  padding-right: 10px;
+  color: #555;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.diff-text {
+  color: #d4d4d4;
+  white-space: pre;
+  word-break: break-all;
+}
+
+.diff-line.diff-local-only .diff-text { color: #f08080; }
+.diff-line.diff-drive-only .diff-text { color: #80d080; }
+
+.conflict-actions {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  padding: 14px 20px;
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.conflict-btn {
+  padding: 8px 28px;
+  border: none;
+  border-radius: 4px;
+  font-size: 0.88rem;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.conflict-btn-local {
+  background: #5a2020;
+  color: #f08080;
+  border: 1px solid #8a3030;
+}
+
+.conflict-btn-local:hover { background: #6e2626; }
+
+.conflict-btn-drive {
+  background: #1a4a1a;
+  color: #80d080;
+  border: 1px solid #2a6a2a;
+}
+
+.conflict-btn-drive:hover { background: #1e5a1e; }
+
 /* Cloud sync status icons */
 .tab-cloud-icon {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+  gap: 1px;
+}
+
+.cloud-only {
+  opacity: 0.85;
+}
+
+.cloud-local {
+  opacity: 1;
 }
 
 .cloud-synced {

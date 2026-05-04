@@ -10,15 +10,61 @@ pub struct DriveFile {
 // ファイル作成 (multipart/related)
 // -----------------------------------------------------------------------
 
+// -----------------------------------------------------------------------
+// フォルダ作成
+// -----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn drive_create_folder(
+    name: String,
+    access_token: String,
+) -> Result<DriveFile, String> {
+    let client = reqwest::Client::new();
+    let metadata = serde_json::json!({
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder"
+    })
+    .to_string();
+
+    let resp = client
+        .post("https://www.googleapis.com/drive/v3/files?fields=id,name")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .body(metadata)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    if let Some(e) = json.get("error") {
+        return Err(format!("Drive create folder error: {}", e));
+    }
+
+    Ok(DriveFile {
+        id: json["id"].as_str().ok_or("id missing")?.to_string(),
+        name: json["name"].as_str().unwrap_or(&name).to_string(),
+    })
+}
+
+// -----------------------------------------------------------------------
+// ファイル作成 (multipart/related)
+// -----------------------------------------------------------------------
+
 #[tauri::command]
 pub async fn drive_create_file(
     name: String,
     content: String,
     access_token: String,
+    parent_id: Option<String>,
 ) -> Result<DriveFile, String> {
     let client = reqwest::Client::new();
     let boundary = "MemoEditBoundary_XYZ_1234567890";
-    let metadata = serde_json::json!({ "name": name, "mimeType": "text/plain" }).to_string();
+    let mut meta = serde_json::json!({ "name": name, "mimeType": "text/plain" });
+    if let Some(pid) = parent_id {
+        meta["parents"] = serde_json::json!([pid]);
+    }
+    let metadata = meta.to_string();
 
     let body = format!(
         "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{m}\r\n\
@@ -81,6 +127,145 @@ pub async fn drive_update_file(
     let json: serde_json::Value = resp.json().await.unwrap_or_default();
     Err(format!(
         "Drive update error: {}",
+        json.get("error").unwrap_or(&serde_json::Value::Null)
+    ))
+}
+
+// -----------------------------------------------------------------------
+// ファイル内容取得
+// -----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn drive_get_file_content(
+    file_id: String,
+    access_token: String,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+            file_id
+        ))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        return resp.text().await.map_err(|e| e.to_string());
+    }
+
+    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+    Err(format!(
+        "Drive get error: {}",
+        json.get("error").unwrap_or(&serde_json::Value::Null)
+    ))
+}
+
+// -----------------------------------------------------------------------
+// ファイル検索
+// -----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn drive_list_files(
+    query: String,
+    access_token: String,
+) -> Result<Vec<DriveFile>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://www.googleapis.com/drive/v3/files")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .query(&[
+            ("q", query.as_str()),
+            ("fields", "files(id,name)"),
+            ("spaces", "drive"),
+            ("pageSize", "5"),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    if let Some(e) = json.get("error") {
+        return Err(format!("Drive list error: {}", e));
+    }
+
+    let files = json["files"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|f| {
+            Some(DriveFile {
+                id: f["id"].as_str()?.to_string(),
+                name: f["name"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+
+    Ok(files)
+}
+
+// -----------------------------------------------------------------------
+// ファイルをフォルダへ移動（すでに対象フォルダにあればスキップ）
+// -----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn drive_move_to_folder(
+    file_id: String,
+    folder_id: String,
+    access_token: String,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+
+    // 現在の親フォルダを取得
+    let meta: serde_json::Value = client
+        .get(format!(
+            "https://www.googleapis.com/drive/v3/files/{}?fields=parents",
+            file_id
+        ))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let parents: Vec<String> = meta["parents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+
+    // すでに対象フォルダにある場合はスキップ
+    if parents.contains(&folder_id) {
+        return Ok(());
+    }
+
+    let remove = parents.join(",");
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?addParents={}&removeParents={}",
+        file_id, folder_id, remove
+    );
+
+    let resp = client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        return Ok(());
+    }
+
+    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+    Err(format!(
+        "Drive move error: {}",
         json.get("error").unwrap_or(&serde_json::Value::Null)
     ))
 }
