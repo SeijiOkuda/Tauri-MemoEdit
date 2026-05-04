@@ -24,6 +24,7 @@ interface AuthUser {
 
 interface Tab {
   id: string;
+  name: string;
   text: string;
   textSaved: string;
   path: string | null;
@@ -35,7 +36,7 @@ interface Tab {
 
 let nextId = 1;
 function createTab(): Tab {
-  return { id: String(nextId++), text: "", textSaved: "", path: null, charCode: "utf-8", driveFileId: null, cloudSync: false, cloudStatus: 'none' };
+  return { id: String(nextId++), name: "新しいファイル", text: "", textSaved: "", path: null, charCode: "utf-8", driveFileId: null, cloudSync: false, cloudStatus: 'none' };
 }
 
 const tabs = ref<Tab[]>([createTab()]);
@@ -64,14 +65,14 @@ const DRIVE_SESSION_FILENAME = '__memo_edit_session__';
 const DRIVE_SESSION_FILE_KEY = 'memo-edit-drive-session-file-id';
 const APP_FOLDER_KEY = 'memo-edit-drive-folder-id';
 interface SavedTab { path: string; charCode: string; }
-interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; }
+interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; name?: string; }
 interface TabSession { tabs?: SavedTabEntry[]; localTabs?: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
 function saveTabSession() {
   const savedTabs: SavedTabEntry[] = tabs.value
     .filter(t => t.path !== null || (!t.path && !!t.driveFileId && t.cloudSync))
     .map(t => t.path
-      ? { path: t.path!, charCode: t.charCode, ...(t.driveFileId ? { driveFileId: t.driveFileId } : {}) }
-      : { driveFileId: t.driveFileId! }
+      ? { path: t.path!, charCode: t.charCode, name: t.name, ...(t.driveFileId ? { driveFileId: t.driveFileId } : {}) }
+      : { driveFileId: t.driveFileId!, name: t.name }
     );
   const active = activeTab.value;
   const session: TabSession = {
@@ -109,13 +110,17 @@ async function getOrCreateAppFolder(token: string): Promise<string> {
 }
 
 async function saveDriveSession(token: string) {
-  const sessionStr = localStorage.getItem(SESSION_KEY);
-  if (!sessionStr) return;
   try {
+    // DriveセッションはdriveFileIdとnameのみ（pathは端末依存なので除外）
+    const driveTabs = tabs.value
+      .filter(t => !!t.driveFileId && t.cloudSync)
+      .map(t => ({ driveFileId: t.driveFileId!, name: t.name }));
+    const content = JSON.stringify({ tabs: driveTabs });
+
     const folderId = await getOrCreateAppFolder(token);
     let fileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
     if (fileId) {
-      await invoke('drive_update_file', { fileId, content: sessionStr, accessToken: token });
+      await invoke('drive_update_file', { fileId, content, accessToken: token });
     } else {
       const files = await invoke<{ id: string; name: string }[]>('drive_list_files', {
         query: `'${folderId}' in parents and name = '${DRIVE_SESSION_FILENAME}' and trashed = false`,
@@ -123,11 +128,11 @@ async function saveDriveSession(token: string) {
       });
       fileId = files[0]?.id ?? null;
       if (fileId) {
-        await invoke('drive_update_file', { fileId, content: sessionStr, accessToken: token });
+        await invoke('drive_update_file', { fileId, content, accessToken: token });
       } else {
         const created = await invoke<{ id: string }>('drive_create_file', {
           name: DRIVE_SESSION_FILENAME,
-          content: sessionStr,
+          content,
           accessToken: token,
           parentId: folderId,
         });
@@ -149,8 +154,13 @@ const setupSaving = ref(false);
 const setupError = ref('');
 
 function tabName(tab: Tab) {
-  if (tab.path) return tab.path.split(/[\\/]/).pop() ?? tab.path;
-  return "新しいファイル";
+  return tab.name;
+}
+
+function cloudIconTitle(tab: Tab) {
+  const status = tab.cloudStatus === 'synced' ? '同期済み' : tab.cloudStatus === 'syncing' ? '同期中...' : '同期エラー';
+  const type = tab.path ? 'ローカル+クラウド' : 'クラウド専用';
+  return `${type} (${status})`;
 }
 
 function isUnsaved(tab: Tab) {
@@ -184,6 +194,7 @@ let unlistenAuthExpired: UnlistenFn | null = null;
 async function restoreTabSession(token: string | null, clearExisting = false) {
   // セッションデータを読み込み（ログイン時はDriveを優先、なければlocalStorage）
   let savedSession: TabSession | null = null;
+  let fromDrive = false;
   if (token) {
     try {
       let driveSessionFileId = localStorage.getItem(DRIVE_SESSION_FILE_KEY);
@@ -202,6 +213,7 @@ async function restoreTabSession(token: string | null, clearExisting = false) {
           accessToken: token,
         });
         savedSession = JSON.parse(content);
+        fromDrive = true;
       }
     } catch {}
   }
@@ -210,6 +222,23 @@ async function restoreTabSession(token: string | null, clearExisting = false) {
     if (sessionStr) {
       try { savedSession = JSON.parse(sessionStr); } catch {}
     }
+  }
+
+  // Driveセッション復元時: ローカルマッピングを逆引きしてpathを補完
+  if (fromDrive && savedSession?.tabs) {
+    try {
+      const mappings = await invoke<{ local: Record<string, string> }>('mapping_get_all');
+      const driveIdToPath: Record<string, string> = {};
+      for (const [path, driveId] of Object.entries(mappings.local)) {
+        driveIdToPath[driveId] = path;
+      }
+      for (const entry of savedSession.tabs) {
+        if (entry.driveFileId && !entry.path) {
+          const localPath = driveIdToPath[entry.driveFileId];
+          if (localPath) entry.path = localPath;
+        }
+      }
+    } catch {}
   }
 
   // ログイン後復元の場合、既存の空タブをリセット
@@ -243,6 +272,7 @@ async function restoreTabSession(token: string | null, clearExisting = false) {
             const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
             const tab = blankTab ?? createTab();
             if (!blankTab) tabs.value.push(tab);
+            tab.name = entry.name ?? "新しいファイル";
             tab.text = content;
             tab.textSaved = content;
             tab.driveFileId = entry.driveFileId;
@@ -263,6 +293,7 @@ async function restoreTabSession(token: string | null, clearExisting = false) {
           const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
           const tab = blankTab ?? createTab();
           if (!blankTab) tabs.value.push(tab);
+          tab.name = entry.name ?? "新しいファイル";
           tab.text = content;
           tab.textSaved = content;
           tab.driveFileId = entry.driveFileId;
@@ -539,6 +570,7 @@ async function openFileInTab(filePath: string) {
   }
 
   tab.path = filePath;
+  tab.name = filePath.split(/[\\/]/).pop() ?? filePath;
   tab.charCode = "utf-8";
   try {
     await loadFileIntoTab(tab, filePath);
@@ -606,6 +638,7 @@ async function saveFile() {
     });
     if (!newPath) return;
     tab.path = newPath;
+    tab.name = newPath.split(/[\\/]/).pop() ?? newPath;
     // クラウド専用→ローカル+クラウドに昇格: マッピングを更新
     if (wasCloudOnly && tab.driveFileId) {
       await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
@@ -642,6 +675,7 @@ async function downloadCloudTab(tab: Tab) {
 
   const wasCloudOnly = tab.cloudSync && !tab.path;
   tab.path = newPath;
+  tab.name = newPath.split(/[\\/]/).pop() ?? newPath;
   if (wasCloudOnly && tab.driveFileId) {
     await invoke('mapping_set_local', { localPath: newPath, driveFileId: tab.driveFileId });
     await invoke('mapping_remove_cloud_only', { driveFileId: tab.driveFileId });
@@ -806,9 +840,12 @@ const insertTab = (e: KeyboardEvent) => {
       @click="activeTabId = tab.id"
       @contextmenu.prevent="showTabContextMenu(tab, $event)"
     >
-      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="'cloud-' + tab.cloudStatus" :title="tab.cloudStatus === 'synced' ? 'クラウド同期済み' : tab.cloudStatus === 'syncing' ? '同期中...' : '同期エラー'">
+      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="['cloud-' + tab.cloudStatus, tab.path ? 'cloud-local' : 'cloud-only']" :title="cloudIconTitle(tab)">
         <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
           <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+        </svg>
+        <svg v-if="tab.path" xmlns="http://www.w3.org/2000/svg" width="9" height="9" viewBox="0 0 24 24" fill="currentColor" style="margin-left:1px">
+          <path d="M19 2H5C3.9 2 3 2.9 3 4v16c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm5-8H7V5h10v3z"/>
         </svg>
       </span>
       <span class="tab-name">{{ tabName(tab) }}{{ isUnsaved(tab) ? ' ●' : '' }}</span>
@@ -1418,6 +1455,15 @@ const insertTab = (e: KeyboardEvent) => {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+  gap: 1px;
+}
+
+.cloud-only {
+  opacity: 0.85;
+}
+
+.cloud-local {
+  opacity: 1;
 }
 
 .cloud-synced {
