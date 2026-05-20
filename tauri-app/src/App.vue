@@ -32,6 +32,8 @@ interface Tab {
   driveFileId: string | null;
   cloudSync: boolean;
   cloudStatus: 'synced' | 'syncing' | 'error' | 'none';
+  isLoading?: boolean;
+  loadingError?: string | null;
 }
 
 let nextId = 1;
@@ -183,9 +185,18 @@ async function confirmIfUnsaved(action: 'exit' | 'reopen' | 'close', tab?: Tab):
 }
 
 async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "utf-8") {
-  const content = await readTextFile(filePath, { encoding });
-  tab.text = content;
-  tab.textSaved = content;
+  tab.isLoading = true;
+  tab.loadingError = null;
+  try {
+    const content = await readTextFile(filePath, { encoding });
+    tab.text = content;
+    tab.textSaved = content;
+  } catch (err) {
+    tab.loadingError = String(err);
+    throw err;
+  } finally {
+    tab.isLoading = false;
+  }
 }
 
 let unlistenAuth: UnlistenFn | null = null;
@@ -572,9 +583,13 @@ async function openFileInTab(filePath: string) {
   tab.path = filePath;
   tab.name = filePath.split(/[\\/]/).pop() ?? filePath;
   tab.charCode = "utf-8";
+  tab.text = "";
+  tab.textSaved = "";
+  tab.loadingError = null;
+  activeTabId.value = tab.id;
+  nextTick(() => textarea.value?.focus());
   try {
     await loadFileIntoTab(tab, filePath);
-    activeTabId.value = tab.id;
 
     // マッピングからDriveの紐づけを復元し、競合チェック
     const mappings = await invoke<{ local: Record<string, string>; cloud_only: { drive_file_id: string; name: string }[] }>('mapping_get_all');
@@ -613,6 +628,9 @@ async function openFileInTab(filePath: string) {
     console.error("❌ ファイル読み込み失敗:", err);
     if (!isBlank) {
       tabs.value = tabs.value.filter(t => t.id !== tab.id);
+      if (activeTabId.value === tab.id) {
+        activeTabId.value = tabs.value.find(t => t.id === cur.id)?.id ?? tabs.value[0]?.id ?? '';
+      }
     } else {
       tab.path = null;
       tab.charCode = 'utf-8';
@@ -836,7 +854,7 @@ const insertTab = (e: KeyboardEvent) => {
       v-for="tab in tabs"
       :key="tab.id"
       class="tab"
-      :class="{ active: tab.id === activeTabId }"
+      :class="{ active: tab.id === activeTabId, loading: tab.isLoading, error: tab.loadingError }"
       @click="activeTabId = tab.id"
       @contextmenu.prevent="showTabContextMenu(tab, $event)"
     >
@@ -858,11 +876,16 @@ const insertTab = (e: KeyboardEvent) => {
       ref="textarea"
       v-model="activeTab.text"
       class="cool-textarea"
+      :class="{ loading: activeTab.isLoading }"
+      :readonly="activeTab.isLoading"
       placeholder="ここにメモを入力..."
       @keydown.tab.prevent="insertTab"
       spellcheck="false"
       autofocus
     ></textarea>
+    <div v-if="activeTab.isLoading || activeTab.loadingError" class="editor-status" :class="{ error: activeTab.loadingError }">
+      {{ activeTab.loadingError ? 'ファイルを読み込めませんでした' : 'ファイルを読み込み中...' }}
+    </div>
   </main>
   <!-- 競合ダイアログ -->
   <div v-if="conflictDialog" class="conflict-overlay">
@@ -1072,6 +1095,7 @@ const insertTab = (e: KeyboardEvent) => {
 <style scoped>
 
 .fullscreen-container {
+  position: relative;
   width: 100vw;
   height: calc(100vh - 70px); /* menu-bar 20px + tab-bar 30px + footer 20px */
   overflow: hidden;
@@ -1098,6 +1122,28 @@ const insertTab = (e: KeyboardEvent) => {
   resize: none;
   outline: none;
   border-radius: 0;
+}
+
+.cool-textarea.loading {
+  color: #9ca3af;
+}
+
+.editor-status {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  padding: 6px 10px;
+  background: rgba(37, 37, 38, 0.92);
+  color: #d4d4d4;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.editor-status.error {
+  color: #fca5a5;
+  border-color: #7f1d1d;
 }
 
 .menu-bar {
@@ -1186,6 +1232,18 @@ const insertTab = (e: KeyboardEvent) => {
   background-color: #18181a;
   color: #f6f6f6;
   border-top: 2px solid #0078d4;
+}
+
+.tab.loading .tab-name::after {
+  content: " 読込中";
+  color: #7dd3fc;
+  font-size: 11px;
+}
+
+.tab.error .tab-name::after {
+  content: " エラー";
+  color: #fca5a5;
+  font-size: 11px;
 }
 
 .tab-name {
