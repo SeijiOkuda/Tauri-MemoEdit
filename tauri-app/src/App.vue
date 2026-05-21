@@ -1412,11 +1412,11 @@ const insertTab = (e: KeyboardEvent) => {
   margin: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 
 .tab-bar::-webkit-scrollbar {
-  height: 3px;
+  height: 0;
 }
 
 .tab {
@@ -1432,7 +1432,9 @@ const insertTab = (e: KeyboardEvent) => {
   user-select: none;
   border-right: 1px solid #1e1e1e;
   white-space: nowrap;
-  flex-shrink: 0;
+  flex: 0 1 clamp(96px, 18vw, 150px);
+  min-width: 72px;
+  max-width: 150px;
   box-sizing: border-box;
 }
 
@@ -1460,7 +1462,8 @@ const insertTab = (e: KeyboardEvent) => {
 }
 
 .tab-name {
-  max-width: 150px;
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
 }
