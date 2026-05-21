@@ -3,11 +3,28 @@ mod drive;
 mod mappings;
 
 use auth::{AuthState, AuthStateMutex, OAuthConfig, OAuthConfigMutex};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, Window, WindowEvent};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -27,6 +44,14 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AuthStateMutex::new(AuthState::default()))
         .manage(OAuthConfigMutex::new(OAuthConfig::default()))
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            show_main_window(app);
+            if let Some(window) = app.get_webview_window("main") {
+                for file_path in args.iter().skip(1) {
+                    let _ = window.emit("open-file", file_path.clone());
+                }
+            }
+        }))
         .setup(|app| {
             // 保存済み OAuth 設定を復元
             if let Some(config) = auth::load_oauth_config(app.handle()) {
@@ -41,6 +66,36 @@ pub fn run() {
                 auth.token = Some(token);
                 auth.user_info = Some(user_info);
             }
+            let menu = MenuBuilder::new(app)
+                .text("show", "表示")
+                .text("quit", "終了")
+                .build()?;
+            let _tray = TrayIconBuilder::new()
+                .tooltip("Tauri-MemoEdit")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => {
+                        show_main_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.emit("app-quit-requested", ());
+                        }
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
             Ok(())
         })
         .plugin(tauri_plugin_process::init())
@@ -55,6 +110,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            hide_main_window,
             frontend_ready,
             auth::start_google_auth,
             auth::get_auth_user,

@@ -210,9 +210,13 @@ function isUnsaved(tab: Tab) {
   return !!tab.isDirty;
 }
 
+function needsLocalSaveConfirm(tab: Tab) {
+  return !!tab.isDirty && !!tab.path;
+}
+
 async function confirmIfUnsaved(action: 'exit' | 'reopen' | 'close', tab?: Tab): Promise<boolean> {
   const hasUnsaved = action === 'exit'
-    ? tabs.value.some(isUnsaved)
+    ? tabs.value.some(needsLocalSaveConfirm)
     : isUnsaved(tab ?? activeTab.value);
   if (!hasUnsaved) return true;
   const message = action === 'exit'
@@ -443,7 +447,11 @@ onMounted(async () => {
   });
 
   await listen("app-close-requested", async () => {
-    exitApp();
+    await closeToTray();
+  });
+
+  await listen("app-quit-requested", async () => {
+    await exitApp();
   });
 
   // 保存済みの認証状態を復元
@@ -898,12 +906,24 @@ async function reOpenFile(tab: Tab, encoding: string) {
 
 async function exitApp() {
   if (!await confirmIfUnsaved('exit')) return;
+  await runBackgroundCloseTasks();
+  await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
+}
+
+async function closeToTray() {
+  if (!await confirmIfUnsaved('exit')) return;
+  await invoke('hide_main_window').catch(err => console.error("hide window failed", err));
+  void runBackgroundCloseTasks();
+}
+
+async function runBackgroundCloseTasks() {
   saveTabSession();
+  const cloudOnlyDirtyTabs = tabs.value.filter(t => !t.path && t.cloudSync && t.driveFileId && isUnsaved(t));
+  await Promise.allSettled(cloudOnlyDirtyTabs.map(t => syncTabToCloud(t)));
   if (authUser.value) {
     const token = await invoke<string | null>('get_access_token');
     if (token) await saveDriveSession(token);
   }
-  await exit().catch(err => console.error("❌ アプリ終了失敗:", err));
 }
 
 async function newTab() {
@@ -974,7 +994,7 @@ const insertTab = (e: KeyboardEvent) => {
         <div class="dropdown-item" @click="newTab">新しいタブ</div>
         <div class="dropdown-item" @click="openFileDialog">開く</div>
         <div class="dropdown-item" @click="saveFile">保存</div>
-        <div class="dropdown-item" @click="exitApp">終了</div>
+        <div class="dropdown-item" @click="closeToTray">終了</div>
       </div>
     </div>
     <div class="menu-item">編集(E)</div>
