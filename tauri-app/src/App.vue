@@ -27,6 +27,7 @@ interface Tab {
   name: string;
   text: string;
   textSaved: string;
+  isDirty?: boolean;
   path: string | null;
   charCode: string;
   driveFileId: string | null;
@@ -44,6 +45,14 @@ function createTab(): Tab {
 const tabs = ref<Tab[]>([createTab()]);
 const activeTabId = ref(tabs.value[0].id);
 const activeTab = computed(() => tabs.value.find(t => t.id === activeTabId.value)!);
+const activeTabText = computed({
+  get: () => activeTab.value.text,
+  set: (value: string) => {
+    const tab = activeTab.value;
+    tab.text = value;
+    tab.isDirty = value !== tab.textSaved;
+  },
+});
 
 const isMenuFile = ref(false);
 const isMenuEncoding = ref(false);
@@ -166,7 +175,7 @@ function cloudIconTitle(tab: Tab) {
 }
 
 function isUnsaved(tab: Tab) {
-  return tab.text !== tab.textSaved;
+  return !!tab.isDirty;
 }
 
 async function confirmIfUnsaved(action: 'exit' | 'reopen' | 'close', tab?: Tab): Promise<boolean> {
@@ -191,9 +200,97 @@ async function loadFileIntoTab(tab: Tab, filePath: string, encoding: string = "u
     const content = await readTextFile(filePath, { encoding });
     tab.text = content;
     tab.textSaved = content;
+    tab.isDirty = false;
   } catch (err) {
     tab.loadingError = String(err);
     throw err;
+  } finally {
+    tab.isLoading = false;
+  }
+}
+
+function prepareLocalTab(tab: Tab, filePath: string, encoding: string = "utf-8") {
+  tab.path = filePath;
+  tab.name = filePath.split(/[\\/]/).pop() ?? filePath;
+  tab.charCode = encoding;
+  tab.text = "";
+  tab.textSaved = "";
+  tab.isDirty = false;
+  tab.loadingError = null;
+  tab.isLoading = true;
+}
+
+function reusableBlankTab() {
+  return tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
+}
+
+async function reconcileLocalDrive(tab: Tab, filePath: string, token: string | null, knownDriveId?: string) {
+  const driveId = knownDriveId ?? (await invoke<{ local: Record<string, string> }>('mapping_get_all')).local[filePath];
+  if (!driveId) return;
+
+  tab.driveFileId = driveId;
+  tab.cloudSync = true;
+  tab.cloudStatus = 'syncing';
+  try {
+    if (token) {
+      const folderId = await getOrCreateAppFolder(token);
+      await invoke('drive_move_to_folder', { fileId: driveId, folderId, accessToken: token }).catch(() => {});
+      const driveContent = await invoke<string>('drive_get_file_content', { fileId: driveId, accessToken: token });
+      if (driveContent !== tab.text) {
+        const choice = await showConflictDialog(tab, tab.text, driveContent);
+        if (choice === 'drive') {
+          tab.text = driveContent;
+          tab.textSaved = driveContent;
+          tab.isDirty = false;
+        } else {
+          tab.isDirty = tab.text !== tab.textSaved;
+        }
+      }
+    }
+    tab.cloudStatus = 'synced';
+  } catch (err) {
+    tab.cloudStatus = 'error';
+    console.error('drive reconcile failed', err);
+  }
+}
+
+async function loadLocalTabInBackground(tab: Tab, entry: SavedTabEntry, token: string | null) {
+  if (!entry.path) return;
+  try {
+    await loadFileIntoTab(tab, entry.path, entry.charCode ?? "utf-8");
+    if (entry.charCode) tab.charCode = entry.charCode;
+    await reconcileLocalDrive(tab, entry.path, token, entry.driveFileId);
+    saveTabSession();
+  } catch (err) {
+    console.error("file load failed", err);
+    if (entry.driveFileId && token) {
+      await loadDriveTabInBackground(tab, entry, token);
+    }
+  }
+}
+
+async function loadDriveTabInBackground(tab: Tab, entry: SavedTabEntry, token: string) {
+  if (!entry.driveFileId) return;
+  tab.isLoading = true;
+  tab.loadingError = null;
+  tab.cloudStatus = 'syncing';
+  try {
+    const folderId = await getOrCreateAppFolder(token);
+    await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
+    const content = await invoke<string>('drive_get_file_content', { fileId: entry.driveFileId, accessToken: token });
+    tab.name = entry.name ?? tab.name;
+    tab.text = content;
+    tab.textSaved = content;
+    tab.isDirty = false;
+    tab.path = null;
+    tab.driveFileId = entry.driveFileId;
+    tab.cloudSync = true;
+    tab.cloudStatus = 'synced';
+    saveTabSession();
+  } catch (err) {
+    tab.loadingError = String(err);
+    tab.cloudStatus = 'error';
+    await invoke('mapping_remove_cloud_only', { driveFileId: entry.driveFileId }).catch(() => {});
   } finally {
     tab.isLoading = false;
   }
@@ -262,60 +359,37 @@ async function restoreTabSession(token: string | null, clearExisting = false) {
   const sessionTabs: SavedTabEntry[] = savedSession?.tabs
     ?? (savedSession?.localTabs?.map(t => ({ path: t.path, charCode: t.charCode })) ?? []);
   if (sessionTabs.length) {
+    const backgroundLoads: Promise<void>[] = [];
     for (const entry of sessionTabs) {
       if (entry.path) {
-        // ローカルパスで開く（失敗時はDriveにフォールバック）
-        const opened = await openFileInTab(entry.path);
-        if (opened) {
-          if (entry.charCode && entry.charCode !== 'utf-8') {
-            const tab = tabs.value.find(t => t.path === entry.path);
-            if (tab) tab.charCode = entry.charCode;
-          }
-        } else if (entry.driveFileId && token) {
-          // ローカルファイルが存在しない（別端末等）→ Driveから開く
-          try {
-            const folderId = await getOrCreateAppFolder(token);
-            await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
-            const content = await invoke<string>('drive_get_file_content', {
-              fileId: entry.driveFileId,
-              accessToken: token,
-            });
-            const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
-            const tab = blankTab ?? createTab();
-            if (!blankTab) tabs.value.push(tab);
-            tab.name = entry.name ?? "新しいファイル";
-            tab.text = content;
-            tab.textSaved = content;
-            tab.driveFileId = entry.driveFileId;
-            tab.cloudSync = true;
-            tab.cloudStatus = 'synced';
-            activeTabId.value = tab.id;
-          } catch {}
-        }
-      } else if (entry.driveFileId && token) {
-        // クラウド専用タブ
-        try {
-          const folderId = await getOrCreateAppFolder(token);
-          await invoke('drive_move_to_folder', { fileId: entry.driveFileId, folderId, accessToken: token }).catch(() => {});
-          const content = await invoke<string>('drive_get_file_content', {
-            fileId: entry.driveFileId,
-            accessToken: token,
-          });
-          const blankTab = tabs.value.find(t => !t.path && !t.driveFileId && t.text === '' && !t.cloudSync);
-          const tab = blankTab ?? createTab();
-          if (!blankTab) tabs.value.push(tab);
-          tab.name = entry.name ?? "新しいファイル";
-          tab.text = content;
-          tab.textSaved = content;
+        const blankTab = reusableBlankTab();
+        const tab = blankTab ?? createTab();
+        if (!blankTab) tabs.value.push(tab);
+        prepareLocalTab(tab, entry.path, entry.charCode ?? "utf-8");
+        if (entry.driveFileId) {
           tab.driveFileId = entry.driveFileId;
           tab.cloudSync = true;
-          tab.cloudStatus = 'synced';
-          activeTabId.value = tab.id;
-        } catch {
-          await invoke('mapping_remove_cloud_only', { driveFileId: entry.driveFileId });
+          tab.cloudStatus = 'syncing';
         }
+        backgroundLoads.push(loadLocalTabInBackground(tab, entry, token));
+      } else if (entry.driveFileId && token) {
+        const blankTab = reusableBlankTab();
+        const tab = blankTab ?? createTab();
+        if (!blankTab) tabs.value.push(tab);
+        tab.name = entry.name ?? tab.name;
+        tab.text = "";
+        tab.textSaved = "";
+        tab.isDirty = false;
+        tab.path = null;
+        tab.driveFileId = entry.driveFileId;
+        tab.cloudSync = true;
+        tab.cloudStatus = 'syncing';
+        tab.isLoading = true;
+        tab.loadingError = null;
+        backgroundLoads.push(loadDriveTabInBackground(tab, entry, token));
       }
     }
+    void Promise.allSettled(backgroundLoads);
   }
 
   // アクティブタブを復元
@@ -456,6 +530,7 @@ async function initCloudForTab(tab: Tab) {
     tab.driveFileId = file.id;
     tab.cloudSync = true;
     tab.textSaved = tab.text;
+    tab.isDirty = false;
     tab.cloudStatus = 'synced';
 
     // マッピングを保存
@@ -481,6 +556,7 @@ async function syncTabToCloud(tab: Tab) {
       accessToken: token,
     });
     tab.textSaved = tab.text;
+    tab.isDirty = false;
     tab.cloudStatus = 'synced';
   } catch (err) {
     tab.cloudStatus = 'error';
@@ -585,9 +661,21 @@ async function openFileInTab(filePath: string) {
   tab.charCode = "utf-8";
   tab.text = "";
   tab.textSaved = "";
+  tab.isDirty = false;
   tab.loadingError = null;
   activeTabId.value = tab.id;
   nextTick(() => textarea.value?.focus());
+  void (async () => {
+    try {
+      await loadFileIntoTab(tab, filePath);
+      const token = await invoke<string | null>('get_access_token').catch(() => null);
+      await reconcileLocalDrive(tab, filePath, token);
+      saveTabSession();
+    } catch (err) {
+      console.error("file load failed", err);
+    }
+  })();
+  return true;
   try {
     await loadFileIntoTab(tab, filePath);
 
@@ -599,7 +687,7 @@ async function openFileInTab(filePath: string) {
         const token = await invoke<string | null>('get_access_token');
         if (token) {
           // フォルダ外のファイルを移動（既存マッピングの移行）
-          const folderId = await getOrCreateAppFolder(token);
+          const folderId = await getOrCreateAppFolder(token as string);
           await invoke('drive_move_to_folder', { fileId: driveId, folderId, accessToken: token }).catch(() => {});
 
           const driveContent = await invoke<string>('drive_get_file_content', {
@@ -612,6 +700,7 @@ async function openFileInTab(filePath: string) {
             if (choice === 'drive') {
               tab.text = driveContent;
               tab.textSaved = driveContent;
+              tab.isDirty = false;
             }
           }
         }
@@ -674,6 +763,7 @@ async function saveFile() {
   try {
     await writeTextFile(tab.path, tab.text);
     tab.textSaved = tab.text;
+    tab.isDirty = false;
     tab.charCode = "utf-8";
     // ローカル保存と同時にクラウドへも同期
     if (tab.cloudSync && tab.driveFileId) {
@@ -702,6 +792,7 @@ async function downloadCloudTab(tab: Tab) {
   try {
     await writeTextFile(tab.path, tab.text);
     tab.textSaved = tab.text;
+    tab.isDirty = false;
     tab.charCode = "utf-8";
     if (tab.cloudSync && tab.driveFileId) {
       await syncTabToCloud(tab);
@@ -762,7 +853,7 @@ async function newTab() {
   activeTabId.value = tab.id;
   nextTick(() => textarea.value?.focus());
   if (authUser.value) {
-    await initCloudForTab(tab);
+    void initCloudForTab(tab);
   }
 }
 
@@ -803,7 +894,7 @@ const insertTab = (e: KeyboardEvent) => {
     const end = textarea.value.selectionEnd;
     const value = textarea.value.value;
 
-    activeTab.value.text = value.substring(0, start) + "\t" + value.substring(end);
+    activeTabText.value = value.substring(0, start) + "\t" + value.substring(end);
 
     nextTick(() => {
       if (textarea.value) {
@@ -858,7 +949,8 @@ const insertTab = (e: KeyboardEvent) => {
       @click="activeTabId = tab.id"
       @contextmenu.prevent="showTabContextMenu(tab, $event)"
     >
-      <span v-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="['cloud-' + tab.cloudStatus, tab.path ? 'cloud-local' : 'cloud-only']" :title="cloudIconTitle(tab)">
+      <span v-if="tab.isLoading" class="tab-loading-icon" title="読み込み中"></span>
+      <span v-else-if="tab.cloudStatus !== 'none'" class="tab-cloud-icon" :class="['cloud-' + tab.cloudStatus, tab.path ? 'cloud-local' : 'cloud-only']" :title="cloudIconTitle(tab)">
         <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
           <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
         </svg>
@@ -874,7 +966,7 @@ const insertTab = (e: KeyboardEvent) => {
   <main class="fullscreen-container">
     <textarea
       ref="textarea"
-      v-model="activeTab.text"
+      v-model="activeTabText"
       class="cool-textarea"
       :class="{ loading: activeTab.isLoading }"
       :readonly="activeTab.isLoading"
@@ -1535,6 +1627,25 @@ const insertTab = (e: KeyboardEvent) => {
 
 .cloud-error {
   color: #e05555;
+}
+
+.tab.loading .tab-name::after {
+  content: none;
+}
+
+.tab-loading-icon {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #4b5563;
+  border-top-color: #7dd3fc;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  animation: tab-loading-spin 0.8s linear infinite;
+}
+
+@keyframes tab-loading-spin {
+  to { transform: rotate(360deg); }
 }
 
 @keyframes cloud-pulse {
