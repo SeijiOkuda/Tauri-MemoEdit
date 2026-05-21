@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 type DiffLineType = 'same' | 'local-only' | 'drive-only';
 interface DiffLine { text: string; type: DiffLineType; }
@@ -75,6 +76,10 @@ const SESSION_KEY = 'memo-edit-tab-session';
 const DRIVE_SESSION_FILENAME = '__memo_edit_session__';
 const DRIVE_SESSION_FILE_KEY = 'memo-edit-drive-session-file-id';
 const APP_FOLDER_KEY = 'memo-edit-drive-folder-id';
+const ZOOM_KEY = 'memo-edit-zoom';
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 3;
+const ZOOM_STEP = 0.1;
 interface SavedTab { path: string; charCode: string; }
 interface SavedTabEntry { path?: string; charCode?: string; driveFileId?: string; name?: string; }
 interface TabSession { tabs?: SavedTabEntry[]; localTabs?: SavedTab[]; activeTabPath: string | null; activeTabDriveId: string | null; }
@@ -92,6 +97,40 @@ function saveTabSession() {
     activeTabDriveId: (!active?.path && active?.driveFileId) ? active.driveFileId : null,
   };
   localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+function clampZoom(value: number) {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(value * 100) / 100));
+}
+
+function readSavedZoom() {
+  const saved = Number(localStorage.getItem(ZOOM_KEY));
+  return Number.isFinite(saved) ? clampZoom(saved) : 1;
+}
+
+const appZoom = ref(readSavedZoom());
+const zoomPercent = computed(() => `${Math.round(appZoom.value * 100)}%`);
+
+async function applyZoom() {
+  const zoom = clampZoom(appZoom.value);
+  appZoom.value = zoom;
+  localStorage.setItem(ZOOM_KEY, String(zoom));
+  try {
+    await getCurrentWebview().setZoom(zoom);
+  } catch (err) {
+    document.body.style.setProperty('zoom', String(zoom));
+    console.error('webview zoom failed', err);
+  }
+}
+
+function changeZoom(delta: number) {
+  appZoom.value = clampZoom(appZoom.value + delta);
+  void applyZoom();
+}
+
+function resetZoom() {
+  appZoom.value = 1;
+  void applyZoom();
 }
 
 async function getOrCreateAppFolder(token: string): Promise<string> {
@@ -433,13 +472,16 @@ onMounted(async () => {
   });
 
   window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("wheel", handleWheel, { passive: false });
   window.addEventListener("click", handleClickOutside);
 
+  void applyZoom();
   invoke("frontend_ready");
 });
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown);
+  window.removeEventListener('wheel', handleWheel);
   window.removeEventListener('click', handleClickOutside);
   unlistenAuth?.();
   unlistenAuthExpired?.();
@@ -806,6 +848,30 @@ function handleKeyDown(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') {
     e.preventDefault();
     saveFile();
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) {
+    if (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd') {
+      e.preventDefault();
+      changeZoom(ZOOM_STEP);
+    } else if (e.key === '-' || e.key === '_' || e.code === 'Minus' || e.code === 'NumpadSubtract') {
+      e.preventDefault();
+      changeZoom(-ZOOM_STEP);
+    } else if (e.key === '0') {
+      e.preventDefault();
+      resetZoom();
+    }
+  }
+}
+
+function handleWheel(e: WheelEvent) {
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  const delta = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (delta < 0) {
+    changeZoom(ZOOM_STEP);
+  } else if (delta > 0) {
+    changeZoom(-ZOOM_STEP);
   }
 }
 
@@ -921,6 +987,11 @@ const insertTab = (e: KeyboardEvent) => {
     <div class="menu-item">編集(E)</div>
     <div class="menu-item">ヘルプ(H)</div>
     <div class="menu-spacer"></div>
+    <div class="zoom-control" title="拡大率">
+      <button class="zoom-button" @click="changeZoom(-ZOOM_STEP)" :disabled="appZoom <= MIN_ZOOM" title="縮小">-</button>
+      <button class="zoom-percent" @click="resetZoom" title="100%に戻す">{{ zoomPercent }}</button>
+      <button class="zoom-button" @click="changeZoom(ZOOM_STEP)" :disabled="appZoom >= MAX_ZOOM" title="拡大">+</button>
+    </div>
     <div class="menu-auth" ref="menuAuthRef">
       <button v-if="!authUser" class="auth-login-btn" @click="loginGoogle" title="Googleでログイン">
         <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
@@ -1278,6 +1349,43 @@ const insertTab = (e: KeyboardEvent) => {
 .dropdown-item:hover {
   background-color: #555;
   color: #ffffff;
+}
+
+.zoom-control {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 2px;
+  color: #f6f6f6;
+  user-select: none;
+}
+
+.zoom-button,
+.zoom-percent {
+  height: 16px;
+  min-width: 22px;
+  border: 1px solid #777;
+  background: #3f3f3f;
+  color: #f6f6f6;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 5px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.zoom-percent {
+  min-width: 46px;
+}
+
+.zoom-button:hover:not(:disabled),
+.zoom-percent:hover {
+  background: #5a5a5a;
+}
+
+.zoom-button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 /* Tab bar */
