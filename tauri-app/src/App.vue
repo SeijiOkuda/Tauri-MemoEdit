@@ -6,7 +6,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 type DiffLineType = 'same' | 'local-only' | 'drive-only';
 interface DiffLine { text: string; type: DiffLineType; }
@@ -111,26 +110,20 @@ function readSavedZoom() {
 const appZoom = ref(readSavedZoom());
 const zoomPercent = computed(() => `${Math.round(appZoom.value * 100)}%`);
 
-async function applyZoom() {
+function applyZoom() {
   const zoom = clampZoom(appZoom.value);
   appZoom.value = zoom;
   localStorage.setItem(ZOOM_KEY, String(zoom));
-  try {
-    await getCurrentWebview().setZoom(zoom);
-  } catch (err) {
-    document.body.style.setProperty('zoom', String(zoom));
-    console.error('webview zoom failed', err);
-  }
 }
 
 function changeZoom(delta: number) {
   appZoom.value = clampZoom(appZoom.value + delta);
-  void applyZoom();
+  applyZoom();
 }
 
 function resetZoom() {
   appZoom.value = 1;
-  void applyZoom();
+  applyZoom();
 }
 
 async function getOrCreateAppFolder(token: string): Promise<string> {
@@ -475,7 +468,7 @@ onMounted(async () => {
   window.addEventListener("wheel", handleWheel, { passive: false });
   window.addEventListener("click", handleClickOutside);
 
-  void applyZoom();
+  applyZoom();
   invoke("frontend_ready");
 });
 
@@ -1034,7 +1027,7 @@ const insertTab = (e: KeyboardEvent) => {
     </div>
     <div class="tab-new" @click="newTab">+</div>
   </div>
-  <main class="fullscreen-container">
+  <main class="fullscreen-container" :style="{ '--app-zoom': appZoom }">
     <textarea
       ref="textarea"
       v-model="activeTabText"
@@ -1278,9 +1271,9 @@ const insertTab = (e: KeyboardEvent) => {
   background: #18181a;
   color: #f6f6f6;
   border: none;
-  font-size: 1.25rem;
+  font-size: calc(1.25rem * var(--app-zoom, 1));
   font-family: 'Fira Mono', 'Consolas', 'Menlo', monospace;
-  padding: 1rem;
+  padding: calc(1rem * var(--app-zoom, 1));
   box-sizing: border-box;
   resize: none;
   outline: none;
